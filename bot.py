@@ -12,7 +12,6 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 # ==================== 1. КОНФИГУРАЦИЯ ====================
