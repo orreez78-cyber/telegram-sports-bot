@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 # ==================== 1. КОНФИГУРАЦИЯ ====================
-load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8933270591:AAGSJJkYl99icR7bwHv51-QlYf6Ff3CDMtM")
 PANDASCORE_API_KEY = os.getenv("PANDASCORE_API_KEY", "aXVsIwT4FSLepT021v4nrPAW9i-W-5y8Au0rrvUc4wg7bSf8IlY")
