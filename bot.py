@@ -536,22 +536,28 @@ async def analyze_match(match):
 # ==================== АВТОМАТИЧЕСКОЕ ОБУЧЕНИЕ ====================
 
 async def first_train(message: types.Message = None):
-    def send(msg):
+    """Первое обучение моделей"""
+    
+    async def send(msg):
+        """Внутренняя async функция для отправки сообщений"""
         if message:
-            asyncio.create_task(message.answer(msg))
+            try:
+                await message.answer(msg)
+            except Exception as e:
+                logger.error(f"Ошибка отправки сообщения: {e}")
         logger.info(msg)
     
-    send("🚀 Начинаю первое обучение моделей...")
+    await send("🚀 Начинаю первое обучение моделей...")
     
-    send("📊 Собираю данные из 4 источников...")
+    await send("📊 Собираю данные из 4 источников...")
     fb_matches = await fetch_football_matches()
     hk_matches = await fetch_hockey_matches()
     es_matches = await fetch_esports_matches()
     
     all_matches = fb_matches + hk_matches + es_matches
-    send(f"✅ Собрано {len(all_matches)} матчей")
+    await send(f"✅ Собрано {len(all_matches)} матчей")
     
-    send("📈 Рассчитываю рейтинги команд...")
+    await send("📈 Рассчитываю рейтинги команд...")
     for match in all_matches:
         await save_team_rating(
             f"{match['sport']}_{match['team1']}", match['sport'],
@@ -566,7 +572,7 @@ async def first_train(message: types.Message = None):
             match.get('team2_goals_avg', 1.5)
         )
     
-    send("🧮 Анализирую матчи математическими моделями...")
+    await send("🧮 Анализирую матчи математическими моделями...")
     predictions_count = 0
     
     for match in all_matches:
@@ -576,7 +582,7 @@ async def first_train(message: types.Message = None):
             if prediction['confidence'] >= MIN_CONFIDENCE:
                 await save_prediction(
                     match['id'], match['sport'],
-                    match['team1'], match['team2'],  # ← ИСПРАВЛЕНО!
+                    match['team1'], match['team2'],
                     prediction['analysis'],
                     prediction['probabilities'],
                     prediction['recommendation'],
@@ -587,11 +593,11 @@ async def first_train(message: types.Message = None):
         except Exception as e:
             logger.error(f"Ошибка анализа {match['team1']} vs {match['team2']}: {e}")
     
-    send(f"✅ Обучение завершено!")
-    send(f"📊 Создано {predictions_count} прогнозов с уверенностью ≥ {MIN_CONFIDENCE}%")
+    await send(f"✅ Обучение завершено!")
+    await send(f"📊 Создано {predictions_count} прогнозов с уверенностью ≥ {MIN_CONFIDENCE}%")
     
     return predictions_count
-
+   
 
 # ==================== ПЛАНИРОВЩИК ====================
 
