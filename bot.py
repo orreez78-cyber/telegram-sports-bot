@@ -655,7 +655,7 @@ async def hourly_predictions_job():
     logger.info(f"📤 Рассылка {len(predictions)} прогнозов {len(users)} пользователям")
     
     for pred in predictions:
-        match_id, sport, analysis, probs_json, rec, conf, bet_type = pred
+       match_id, sport, analysis, probs_json, rec, conf, bet_type, created_at = pred
         probs = json.loads(probs_json)
         
         sport_emoji = {'football': '⚽️', 'hockey': '🏒', 'esports': '🎮'}.get(sport, '🏆')
@@ -769,7 +769,7 @@ async def show_today(callback: types.CallbackQuery):
     text = f"📅 <b>Прогнозы на сегодня ({len(predictions)} шт.)</b>\n\n"
     
     for i, pred in enumerate(predictions[:5], 1):
-        match_id, sport, analysis, probs_json, rec, conf, bet_type = pred
+        match_id, sport, analysis, probs_json, rec, conf, bet_type, created_at = pred
         sport_emoji = {'football': '⚽️', 'hockey': '🏒', 'esports': '🎮'}.get(sport, '🏆')
         text += f"{i}. {sport_emoji} <b>{rec}</b> ({conf}%)\n   Тип: {bet_type}\n\n"
     
