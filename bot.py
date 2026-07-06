@@ -1,632 +1,789 @@
 import asyncio
 import json
 import logging
+import math
 import os
-from datetime import datetime
+import random
+from datetime import datetime, timedelta
 
 import aiohttp
 import aiosqlite
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.exceptions import TelegramBadRequest
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
-from openai import AsyncOpenAI
 
-# ==================== 1. КОНФИГУРАЦИЯ ====================
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8933270591:AAGSJJkYl99icR7bwHv51-QlYf6Ff3CDMtM")
-PANDASCORE_API_KEY = os.getenv("PANDASCORE_API_KEY", "aXVsIwT4FSLepT021v4nrPAW9i-W-5y8Au0rrvUc4wg7bSf8IlY")
-FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "3540a4964edea4e653d2a322ddec0270")
+# ==================== НАСТРОЙКИ ====================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")
 HOCKEY_API_KEY = os.getenv("HOCKEY_API_KEY", "123")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
+ESPORTS_API_KEY = os.getenv("ESPORTS_API_KEY", "")
 
-MIN_CONFIDENCE = 60
+MIN_CONFIDENCE = 50  # Порог вероятности 50%
+PREDICTIONS_PER_HOUR = 3  # Прогнозов в час
 DB_NAME = "sports_bot.db"
+MODELS_DIR = "models_data"
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация клиентов
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# ==================== 2. БАЗА ДАННЫХ ====================
+# ==================== МАТЕМАТИЧЕСКИЕ МОДЕЛИ ====================
+
+class PoissonModel:
+    """Модель Пуассона для расчёта вероятности голов"""
+    
+    @staticmethod
+    def poisson_probability(k, lam):
+        """P(X=k) = (λ^k * e^(-λ)) / k!"""
+        return (lam ** k * math.exp(-lam)) / math.factorial(k)
+    
+    @staticmethod
+    def calculate_match_probabilities(team1_goals_avg, team2_goals_avg):
+        """
+        Рассчитать вероятности исхода матча через модель Пуассона
+        Возвращает: (P1, X, P2) в процентах
+        """
+        p1_total = 0
+        p2_total = 0
+        draw_total = 0
+        
+        # Перебираем все возможные счета до 7:7
+        for i in range(0, 8):
+            for j in range(0, 8):
+                p_i = PoissonModel.poisson_probability(i, team1_goals_avg)
+                p_j = PoissonModel.poisson_probability(j, team2_goals_avg)
+                p_score = p_i * p_j
+                
+                if i > j:
+                    p1_total += p_score
+                elif i < j:
+                    p2_total += p_score
+                else:
+                    draw_total += p_score
+        
+        # Нормализация
+        total = p1_total + draw_total + p2_total
+        return (
+            round(p1_total / total * 100, 1),
+            round(draw_total / total * 100, 1),
+            round(p2_total / total * 100, 1)
+        )
+    
+    @staticmethod
+    def total_probability(team1_goals_avg, team2_goals_avg, line=2.5):
+        """Вероятность тотала больше/меньше"""
+        total_lam = team1_goals_avg + team2_goals_avg
+        p_over = sum(PoissonModel.poisson_probability(k, total_lam) 
+                     for k in range(math.ceil(line), 20))
+        return round(p_over * 100, 1)
+
+
+class EloRating:
+    """Система рейтинга Эло для команд"""
+    
+    @staticmethod
+    def expected_score(rating_a, rating_b):
+        """Ожидаемый результат для команды A"""
+        return 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
+    
+    @staticmethod
+    def update_rating(rating, expected, actual, k=32):
+        """Обновление рейтинга после матча"""
+        return rating + k * (actual - expected)
+    
+    @staticmethod
+    def calculate_win_probability(rating_a, rating_b):
+        """Вероятность победы A над B"""
+        return round(EloRating.expected_score(rating_a, rating_b) * 100, 1)
+
+
+class BradleyTerryModel:
+    """Модель Брэдли-Терри для парных сравнений"""
+    
+    @staticmethod
+    def win_probability(strength_a, strength_b):
+        """Вероятность победы A"""
+        exp_a = math.exp(strength_a)
+        exp_b = math.exp(strength_b)
+        return round(exp_a / (exp_a + exp_b) * 100, 1)
+
+
+class EnsemblePredictor:
+    """Ансамбль моделей для итогового прогноза"""
+    
+    def __init__(self):
+        self.weights = {
+            'poisson': 0.35,
+            'elo': 0.25,
+            'bradley_terry': 0.20,
+            'form': 0.20
+        }
+    
+    def predict(self, team1_data, team2_data):
+        """
+        team1_data, team2_data - словари с данными:
+        - goals_avg: средняя результативность
+        - elo_rating: рейтинг Эло
+        - strength: сила команды (0-100)
+        - form: форма (0-100)
+        """
+        # 1. Модель Пуассона
+        p1_p, x_p, p2_p = PoissonModel.calculate_match_probabilities(
+            team1_data['goals_avg'], team2_data['goals_avg']
+        )
+        
+        # 2. Модель Эло
+        p1_e = EloRating.calculate_win_probability(
+            team1_data['elo_rating'], team2_data['elo_rating']
+        )
+        p2_e = 100 - p1_e
+        x_e = 20  # Ничья в Эло
+    
+        # 3. Модель Брэдли-Терри
+        p1_bt = BradleyTerryModel.win_probability(
+            team1_data['strength'], team2_data['strength']
+        )
+        p2_bt = 100 - p1_bt
+        x_bt = 20
+    
+        # 4. Форма команд
+        form_diff = team1_data['form'] - team2_data['form']
+        p1_f = 50 + form_diff * 0.3
+        p2_f = 100 - p1_f
+        x_f = 25
+    
+        # Взвешенное объединение
+        w = self.weights
+        p1 = (p1_p * w['poisson'] + p1_e * w['elo'] + 
+              p1_bt * w['bradley_terry'] + p1_f * w['form'])
+        p2 = (p2_p * w['poisson'] + p2_e * w['elo'] + 
+              p2_bt * w['bradley_terry'] + p2_f * w['form'])
+        x = (x_p * w['poisson'] + x_e * w['elo'] + 
+             x_bt * w['bradley_terry'] + x_f * w['form'])
+        
+        # Нормализация
+        total = p1 + x + p2
+        p1 = round(p1 / total * 100, 1)
+        x = round(x / total * 100, 1)
+        p2 = round(p2 / total * 100, 1)
+        
+        # Тотал больше 2.5
+        total_over = PoissonModel.total_probability(
+            team1_data['goals_avg'], team2_data['goals_avg'], 2.5
+        )
+        
+        return {
+            'p1': p1, 'x': x, 'p2': p2,
+            'total_over_2.5': total_over,
+            'method': 'Ансамбль (Пуассон + Эло + Брэдли-Терри + Форма)'
+        }
+
+
+# ==================== БАЗА ДАННЫХ ====================
+
 async def init_db():
-    """Инициализация базы данных SQLite"""
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS matches (
-                match_id TEXT PRIMARY KEY,
-                sport TEXT,
-                team1 TEXT,
-                team2 TEXT,
-                match_date TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS predictions (
-                match_id TEXT PRIMARY KEY,
-                sport TEXT,
-                analysis TEXT,
-                probabilities TEXT,
-                recommendation TEXT,
-                confidence INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+        await db.execute("""CREATE TABLE IF NOT EXISTS users 
+            (user_id INTEGER PRIMARY KEY, username TEXT, 
+             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS matches 
+            (match_id TEXT PRIMARY KEY, sport TEXT, team1 TEXT, 
+             team2 TEXT, match_date TEXT)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS predictions 
+            (match_id TEXT PRIMARY KEY, sport TEXT, analysis TEXT, 
+             probabilities TEXT, recommendation TEXT, confidence REAL,
+             bet_type TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS sent_predictions 
+            (id INTEGER PRIMARY KEY AUTOINCREMENT, match_id TEXT, 
+             user_id INTEGER, sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS team_ratings 
+            (team_id TEXT PRIMARY KEY, sport TEXT, elo REAL DEFAULT 1500,
+             strength REAL DEFAULT 50, goals_avg REAL DEFAULT 1.5,
+             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         await db.commit()
-    logger.info("✅ База данных инициализирована")
 
 async def add_user(user_id: int, username: str):
-    """Добавление пользователя в БД"""
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)",
-            (user_id, username)
-        )
+        await db.execute("INSERT OR IGNORE INTO users VALUES (?, ?, datetime('now'))",
+                        (user_id, username))
         await db.commit()
 
 async def get_all_users():
-    """Получение всех пользователей"""
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT user_id FROM users") as cursor:
             return [row[0] async for row in cursor]
 
-async def remove_user(user_id: int):
-    """Удаление пользователя из БД"""
+async def save_prediction(match_id, sport, analysis, probs, rec, conf, bet_type):
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        await db.execute("""INSERT OR REPLACE INTO predictions 
+            (match_id, sport, analysis, probabilities, recommendation, confidence, bet_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (match_id, sport, analysis, json.dumps(probs), rec, conf, bet_type))
         await db.commit()
-
-async def save_match(match_id: str, sport: str, team1: str, team2: str, match_date: str):
-    """Сохранение матча в БД"""
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO matches (match_id, sport, team1, team2, match_date) VALUES (?, ?, ?, ?, ?)",
-            (match_id, sport, team1, team2, match_date)
-        )
-        await db.commit()
-
-async def save_prediction(match_id: str, sport: str, analysis: str, probs: str, rec: str, conf: int):
-    """Сохранение прогноза в БД"""
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            """INSERT OR REPLACE INTO predictions 
-            (match_id, sport, analysis, probabilities, recommendation, confidence) 
-            VALUES (?, ?, ?, ?, ?, ?)""",
-            (match_id, sport, analysis, probs, rec, conf)
-        )
-        await db.commit()
-
-async def get_prediction(match_id: str):
-    """Получение прогноза из БД"""
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT * FROM predictions WHERE match_id = ?", (match_id,)
-        ) as cursor:
-            return await cursor.fetchone()
 
 async def get_today_predictions():
-    """Получение всех прогнозов на сегодня"""
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            """SELECT * FROM predictions 
-            WHERE date(created_at) = date('now') AND confidence >= ?""",
-            (MIN_CONFIDENCE,)
-        ) as cursor:
+        async with db.execute("""SELECT * FROM predictions 
+            WHERE date(created_at) = date('now') AND confidence >= ?
+            ORDER BY confidence DESC""", (MIN_CONFIDENCE,)) as cursor:
             return await cursor.fetchall()
 
-# ==================== 3. СПОРТИВНЫЕ API ====================
+async def get_unsent_predictions(limit=3):
+    """Получить прогнозы, которые ещё не были отправлены"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""SELECT p.* FROM predictions p
+            LEFT JOIN sent_predictions s ON p.match_id = s.match_id
+            WHERE s.id IS NULL AND p.confidence >= ?
+            ORDER BY p.confidence DESC LIMIT ?""",
+            (MIN_CONFIDENCE, limit)) as cursor:
+            return await cursor.fetchall()
+
+async def mark_prediction_sent(match_id, user_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT INTO sent_predictions (match_id, user_id) VALUES (?, ?)",
+                        (match_id, user_id))
+        await db.commit()
+
+async def save_team_rating(team_id, sport, elo, strength, goals_avg):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""INSERT OR REPLACE INTO team_ratings 
+            (team_id, sport, elo, strength, goals_avg, updated_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+            (team_id, sport, elo, strength, goals_avg))
+        await db.commit()
+
+async def get_team_rating(team_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT * FROM team_ratings WHERE team_id = ?",
+                             (team_id,)) as cursor:
+            return await cursor.fetchone()
+
+
+# ==================== API ДАННЫХ ====================
+
 async def fetch_football_matches():
-    """Получение списка футбольных матчей"""
+    """Получить футбольные матчи"""
     if not FOOTBALL_API_KEY:
-        # Мок-данные для тестирования
-        logger.info("📝 Используем мок-данные для футбола")
+        today = datetime.now().strftime("%Y-%m-%d")
         return [
-            {
-                "id": "fb_101",
-                "team1": "Арсенал",
-                "team2": "Челси",
-                "date": datetime.now().strftime("%Y-%m-%d")
-            },
-            {
-                "id": "fb_102",
-                "team1": "Манчестер Сити",
-                "team2": "Ливерпуль",
-                "date": datetime.now().strftime("%Y-%m-%d")
-            }
+            {"id": "fb_101", "team1": "Арсенал", "team2": "Челси", 
+             "date": today, "sport": "football",
+             "team1_goals_avg": 2.3, "team2_goals_avg": 1.5,
+             "team1_elo": 1850, "team2_elo": 1720,
+             "team1_strength": 78, "team2_strength": 65,
+             "team1_form": 75, "team2_form": 55},
+            {"id": "fb_102", "team1": "Манчестер Сити", "team2": "Ливерпуль",
+             "date": today, "sport": "football",
+             "team1_goals_avg": 2.8, "team2_goals_avg": 2.1,
+             "team1_elo": 1920, "team2_elo": 1880,
+             "team1_strength": 85, "team2_strength": 82,
+             "team1_form": 80, "team2_form": 72},
+            {"id": "fb_103", "team1": "Реал Мадрид", "team2": "Барселона",
+             "date": today, "sport": "football",
+             "team1_goals_avg": 2.5, "team2_goals_avg": 2.4,
+             "team1_elo": 1900, "team2_elo": 1870,
+             "team1_strength": 83, "team2_strength": 80,
+             "team1_form": 78, "team2_form": 70},
         ]
     
-    # Реальный запрос к API-Football
     url = "https://v3.football.api-sports.io/fixtures"
     headers = {"x-apisports-key": FOOTBALL_API_KEY}
-    params = {"date": datetime.now().strftime("%Y-%m-%d"), "league": "39"}
+    params = {"date": datetime.now().strftime("%Y-%m-%d")}
     
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers, params=params) as resp:
             data = await resp.json()
-            return [
-                {
-                    "id": str(f['fixture']['id']),
+            return [{"id": str(f['fixture']['id']), 
                     "team1": f['teams']['home']['name'],
                     "team2": f['teams']['away']['name'],
-                    "date": f['fixture']['date']
-                }
-                for f in data.get('response', [])
-            ]
+                    "date": f['fixture']['date'],
+                    "sport": "football"}
+                   for f in data.get('response', [])]
 
-async def fetch_football_stats(match_id: str):
-    """Получение статистики футбольного матча"""
-    # В реальности: запрос к /fixtures/statistics и /fixtures/injuries
-    return {
-        "form1": "В В Н В П (последние 5 матчей)",
-        "form2": "П П В П Н (последние 5 матчей)",
-        "h2h": "2 победы А, 1 ничья, 2 победы Б (последние 5 встреч)",
-        "injuries": "У команды А травмирован основной нападающий",
-        "motivation": "Команда А борется за топ-4, команда Б в середине таблицы"
-    }
 
 async def fetch_hockey_matches():
-    """Получение списка хоккейных матчей"""
-    logger.info("📝 Используем мок-данные для хоккея")
+    """Получить хоккейные матчи"""
+    today = datetime.now().strftime("%Y-%m-%d")
     return [
-        {
-            "id": "hk_301",
-            "team1": "ЦСКА",
-            "team2": "СКА",
-            "date": datetime.now().strftime("%Y-%m-%d")
-        }
+        {"id": "hk_301", "team1": "ЦСКА", "team2": "СКА",
+         "date": today, "sport": "hockey",
+         "team1_goals_avg": 3.2, "team2_goals_avg": 2.8,
+         "team1_elo": 1750, "team2_elo": 1780,
+         "team1_strength": 72, "team2_strength": 75,
+         "team1_form": 70, "team2_form": 74},
+        {"id": "hk_302", "team1": "Ак Барс", "team2": "Металлург",
+         "date": today, "sport": "hockey",
+         "team1_goals_avg": 2.9, "team2_goals_avg": 3.1,
+         "team1_elo": 1700, "team2_elo": 1720,
+         "team1_strength": 68, "team2_strength": 70,
+         "team1_form": 65, "team2_form": 68},
     ]
 
-async def fetch_hockey_stats(match_id: str):
-    """Получение статистики хоккейного матча"""
-    return {
-        "form1": "В В В П В",
-        "form2": "В П В В П",
-        "goalies": "В воротах А - основной вратарь, в воротах Б - дублер",
-        "schedule": "Команда А играет вторую игру за два дня (back-to-back)",
-        "powerplay": "Реализация большинства: А - 25%, Б - 18%",
-        "motivation": "Обе команды борются за первое место в конференции"
-    }
 
 async def fetch_esports_matches():
-    """Получение списка киберспортивных матчей"""
-    if not ESPORTS_API_KEY:
-        logger.info("📝 Используем мок-данные для киберспорта")
-        return [
-            {
-                "id": "es_201",
-                "team1": "NaVi",
-                "team2": "FaZe",
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "game": "cs2"
-            }
-        ]
-    
-    # Реальный запрос к PandaScore
-    url = "https://api.pandascore.co/csgo/matches/running"
-    headers = {"Authorization": f"Bearer {ESPORTS_API_KEY}"}
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            data = await resp.json()
-            return [
-                {
-                    "id": str(m['id']),
-                    "team1": m['opponents'][0]['opponent']['name'],
-                    "team2": m['opponents'][1]['opponent']['name'],
-                    "date": m['begin_at'],
-                    "game": "cs2"
-                }
-                for m in data
-            ]
+    """Получить киберспортивные матчи"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    return [
+        {"id": "es_201", "team1": "NaVi", "team2": "FaZe",
+         "date": today, "sport": "esports",
+         "team1_goals_avg": 1.3, "team2_goals_avg": 1.2,
+         "team1_elo": 1800, "team2_elo": 1780,
+         "team1_strength": 80, "team2_strength": 78,
+         "team1_form": 75, "team2_form": 72},
+        {"id": "es_202", "team1": "Team Spirit", "team2": "Gaimin Gladiators",
+         "date": today, "sport": "esports",
+         "team1_goals_avg": 1.4, "team2_goals_avg": 1.3,
+         "team1_elo": 1820, "team2_elo": 1790,
+         "team1_strength": 82, "team2_strength": 79,
+         "team1_form": 78, "team2_form": 74},
+    ]
 
-async def fetch_esports_stats(match_id: str):
-    """Получение статистики киберспортивного матча"""
+
+# ==================== АНАЛИЗАТОР ====================
+
+async def analyze_match(match):
+    """Анализировать матч с помощью математических моделей"""
+    team1_data = {
+        'goals_avg': match.get('team1_goals_avg', 1.5),
+        'elo_rating': match.get('team1_elo', 1500),
+        'strength': match.get('team1_strength', 50),
+        'form': match.get('team1_form', 50),
+    }
+    team2_data = {
+        'goals_avg': match.get('team2_goals_avg', 1.5),
+        'elo_rating': match.get('team2_elo', 1500),
+        'strength': match.get('team2_strength', 50),
+        'form': match.get('team2_form', 50),
+    }
+    
+    predictor = EnsemblePredictor()
+    result = predictor.predict(team1_data, team2_data)
+    
+    # Определить лучшую ставку
+    max_prob = max(result['p1'], result['x'], result['p2'], result['total_over_2.5'])
+    
+    if max_prob == result['p1']:
+        rec = f"П1 ({match['team1']})"
+        conf = result['p1']
+        bet_type = "Исход"
+    elif max_prob == result['p2']:
+        rec = f"П2 ({match['team2']})"
+        conf = result['p2']
+        bet_type = "Исход"
+    elif max_prob == result['x']:
+        rec = "Ничья (X)"
+        conf = result['x']
+        bet_type = "Исход"
+    else:
+        rec = "Тотал больше 2.5"
+        conf = result['total_over_2.5']
+        bet_type = "Тотал"
+    
+    # Анализ
+    analysis = (
+        f"📊 Математический анализ:\n"
+        f"• Пуассон: П1={result['p1']}%, X={result['x']}%, П2={result['p2']}%\n"
+        f"• Эло рейтинг: {team1_data['elo_rating']} vs {team2_data['elo_rating']}\n"
+        f"• Форма: {team1_data['form']} vs {team2_data['form']}\n"
+        f"• Ожидаемые голы: {team1_data['goals_avg']} vs {team2_data['goals_avg']}"
+    )
+    
+    probs = {
+        'p1': result['p1'], 'x': result['x'], 'p2': result['p2'],
+        'total_over_2.5': result['total_over_2.5']
+    }
+    
     return {
-        "form1": "В В В П (последние 4 матча)",
-        "form2": "В П В В (последние 4 матча)",
-        "map_pool": "Mirage, Inferno, Nuke, Anubis",
-        "format": "BO3 (Best of 3)",
-        "patch": "Версия 1.38.2.0 (нерф AWP, бафф M4A1-S)",
-        "motivation": "Плей-офф IEM Katowice 2024"
+        'analysis': analysis,
+        'probabilities': probs,
+        'recommendation': rec,
+        'confidence': round(conf, 1),
+        'bet_type': bet_type,
+        'method': result['method']
     }
 
-# ==================== 4. АНАЛИЗАТОР (LLM) ====================
-PROMPTS = {
-    "football": """
-Ты — профессиональный футбольный аналитик с 20-летним опытом.
-Твоя задача: проанализировать матч на основе предоставленных фактов.
 
-Ключевые факторы для футбола:
-- Текущая форма команд (последние 5 матчей)
-- Личные встречи (H2H)
-- Травмы и дисквалификации ключевых игроков
-- Мотивация (борьба за титул, выживание, ничего не решает)
-- Домашнее/выездное преимущество
+# ==================== АВТОМАТИЧЕСКОЕ ОБУЧЕНИЕ ====================
 
-ВАЖНО: В футболе часто бывают ничьи и низовая результативность. Учитывай это при расчете вероятностей.
-
-Данные о матче:
-{data}
-""",
-    "hockey": """
-Ты — профессиональный хоккейный аналитик.
-Твоя задача: проанализировать матч на основе предоставленных фактов.
-
-Ключевые факторы для хоккея:
-- Кто стоит в воротах (основной/дублер) - это критически важно
-- Плотность календаря (back-to-back игры)
-- Реализация большинства и меньшинства
-- Текущая форма команд
-- Мотивация
-
-ВАЖНО: В хоккее вратарь может решить исход матча. Если у команды играет дублер - это серьезный минус.
-
-Данные о матче:
-{data}
-""",
-    "esports": """
-Ты — профессиональный киберспортивный аналитик (CS2/Dota2/LoL).
-Твоя задача: проанализировать матч на основе предоставленных фактов.
-
-Ключевые факторы для киберспорта:
-- Формат серии (BO1/BO3/BO5) - в BO1 чаще бывают сенсации
-- Пул карт и предпочтения команд
-- Последние изменения патчей (мета) - кто лучше адаптировался
-- Текущая форма игроков
-- Мотивация (турнирная важность)
-
-ВАЖНО: В киберспорте мета меняется очень быстро. Если был недавний патч - это может кардинально изменить расклад сил.
-
-Данные о матче:
-{data}
-"""
-}
-
-async def analyze_match(sport: str, match_data: dict, stats: dict) -> dict:
-    """Анализ матча с помощью LLM"""
-    # Формируем строку с данными
-    data_str = f"{match_data['team1']} vs {match_data['team2']}\n"
-    data_str += "\n".join([f"{k}: {v}" for k, v in stats.items()])
+async def first_train(message: types.Message = None):
+    """Первое обучение моделей"""
+    log_msg = logger.info if not message else None
     
-    # Выбираем промпт в зависимости от вида спорта
-    prompt_base = PROMPTS.get(sport, PROMPTS["football"]).format(data=data_str)
+    def send(msg):
+        if message:
+            asyncio.create_task(message.answer(msg))
+        logger.info(msg)
     
-    full_prompt = prompt_base + """
-
-ЗАДАЧА:
-1. Кратко распиши плюсы и минусы каждой команды (2-3 пункта).
-2. Рассчитай вероятности исходов в процентах. Сумма должна быть ровно 100%.
-3. Выбери рекомендуемую ставку ТОЛЬКО если максимальная вероятность >= 60%.
-4. Если уверенности нет - верни null в recommended_bet.
-
-ОТВЕТЬ СТРОГО В ФОРМАТЕ JSON (без markdown, без лишнего текста):
-{
-    "analysis": "Краткий логический разбор ситуации (2-3 предложения)",
-    "pros_cons": {
-        "team1": ["плюс1", "плюс2", "минус1"],
-        "team2": ["плюс1", "плюс2", "минус1"]
-    },
-    "probabilities": {
-        "team1_win": число_от_0_до_100,
-        "draw": число_от_0_до_100,
-        "team2_win": число_от_0_до_100
-    },
-    "recommended_bet": "Название исхода (например, П1, Тотал больше 2.5, Фора1 -1.5) или null",
-    "confidence": число_от_0_до_100 (равно вероятности рекомендуемой ставки)
-}
-"""
+    send("🚀 Начинаю первое обучение моделей...")
     
-    try:
-        response = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",  # Дешевле и быстрее
-            messages=[{"role": "user", "content": full_prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.3  # Меньше креативности, больше точности
-        )
-        
-        result = json.loads(response.choices[0].message.content)
-        logger.info(f"✅ Анализ завершен для {match_data['team1']} vs {match_data['team2']}")
-        return result
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка анализа: {e}")
-        return {
-            "analysis": "Ошибка анализа",
-            "pros_cons": {"team1": [], "team2": []},
-            "probabilities": {"team1_win": 33, "draw": 34, "team2_win": 33},
-            "recommended_bet": None,
-            "confidence": 0
-        }
-
-# ==================== 5. ПЛАНИРОВЩИК ====================
-async def daily_analysis_job():
-    """Ежедневная задача: анализ матчей и рассылка прогнозов"""
-    logger.info("🚀 Запуск ежедневного анализа матчей...")
-    
-    # 1. Собираем все матчи на сегодня
-    all_matches = []
-    
-    # Футбол
+    # 1. Сбор данных
+    send("📊 Собираю данные о матчах...")
     fb_matches = await fetch_football_matches()
-    for m in fb_matches:
-        m['sport'] = 'football'
-        await save_match(m['id'], 'football', m['team1'], m['team2'], m['date'])
-    all_matches.extend(fb_matches)
-    
-    # Хоккей
     hk_matches = await fetch_hockey_matches()
-    for m in hk_matches:
-        m['sport'] = 'hockey'
-        await save_match(m['id'], 'hockey', m['team1'], m['team2'], m['date'])
-    all_matches.extend(hk_matches)
-    
-    # Киберспорт
     es_matches = await fetch_esports_matches()
-    for m in es_matches:
-        m['sport'] = 'esports'
-        await save_match(m['id'], 'esports', m['team1'], m['team2'], m['date'])
-    all_matches.extend(es_matches)
     
-    logger.info(f"📊 Найдено {len(all_matches)} матчей для анализа")
+    all_matches = fb_matches + hk_matches + es_matches
+    send(f"✅ Собрано {len(all_matches)} матчей")
     
-    # 2. Анализируем каждый матч
-    good_predictions = []
+    # 2. Сохранение рейтингов команд
+    send("📈 Рассчитываю рейтинги команд...")
+    for match in all_matches:
+        await save_team_rating(
+            f"{match['sport']}_{match['team1']}", match['sport'],
+            match.get('team1_elo', 1500),
+            match.get('team1_strength', 50),
+            match.get('team1_goals_avg', 1.5)
+        )
+        await save_team_rating(
+            f"{match['sport']}_{match['team2']}", match['sport'],
+            match.get('team2_elo', 1500),
+            match.get('team2_strength', 50),
+            match.get('team2_goals_avg', 1.5)
+        )
+    
+    # 3. Анализ всех матчей
+    send(" Анализирую матчи математическими моделями...")
+    predictions_count = 0
     
     for match in all_matches:
-        match_id = match['id']
-        sport = match['sport']
-        
-        # Проверяем кэш в БД
-        cached = await get_prediction(match_id)
-        
-        if cached:
-            # Используем кэшированный прогноз
-            prediction = {
-                "analysis": cached[2],
-                "probabilities": cached[3],
-                "recommended_bet": cached[4],
-                "confidence": cached[5]
-            }
-            logger.info(f"📦 Используем кэш для {match['team1']} vs {match['team2']}")
-        else:
-            # Анализируем с нуля
-            if sport == 'football':
-                stats = await fetch_football_stats(match_id)
-            elif sport == 'hockey':
-                stats = await fetch_hockey_stats(match_id)
-            else:
-                stats = await fetch_esports_stats(match_id)
+        try:
+            prediction = await analyze_match(match)
             
-            prediction = await analyze_match(sport, match, stats)
-            
-            # Сохраняем в БД
-            await save_prediction(
-                match_id,
-                sport,
-                prediction['analysis'],
-                json.dumps(prediction['probabilities']),
-                prediction['recommended_bet'],
-                prediction['confidence']
-            )
-        
-        # Фильтруем только уверенные прогнозы
-        if prediction['confidence'] >= MIN_CONFIDENCE and prediction['recommended_bet']:
-            good_predictions.append({
-                "match": match,
-                "prediction": prediction
-            })
+            if prediction['confidence'] >= MIN_CONFIDENCE:
+                await save_prediction(
+                    match['id'], match['sport'],
+                    prediction['analysis'],
+                    prediction['probabilities'],
+                    prediction['recommendation'],
+                    prediction['confidence'],
+                    prediction['bet_type']
+                )
+                predictions_count += 1
+        except Exception as e:
+            logger.error(f"Ошибка анализа {match['team1']} vs {match['team2']}: {e}")
     
-    logger.info(f"✅ Найдено {len(good_predictions)} уверенных прогнозов")
+    send(f"✅ Обучение завершено!")
+    send(f"📊 Создано {predictions_count} прогнозов с уверенностью ≥ {MIN_CONFIDENCE}%")
+    send("🎯 Теперь бот будет автоматически:")
+    send("• Собирать данные каждый день")
+    send("• Рассылать 3 прогноза каждый час")
+    send("• Обновлять рейтинги команд")
     
-    # 3. Рассылаем прогнозы пользователям
-    if good_predictions:
-        users = await get_all_users()
-        logger.info(f"📤 Рассылка {len(good_predictions)} прогнозов {len(users)} пользователям...")
+    return predictions_count
+
+
+# ==================== ПЛАНИРОВЩИК ====================
+
+async def hourly_predictions_job():
+    """Ежечасная рассылка 3 прогнозов"""
+    logger.info(" Запуск ежечасной рассылки...")
+    
+    users = await get_all_users()
+    if not users:
+        logger.info("Нет пользователей для рассылки")
+        return
+    
+    predictions = await get_unsent_predictions(limit=PREDICTIONS_PER_HOUR)
+    
+    if not predictions:
+        # Если нет непроверенных прогнозов - проанализировать новые матчи
+        fb = await fetch_football_matches()
+        hk = await fetch_hockey_matches()
+        es = await fetch_esports_matches()
         
-        for pred_data in good_predictions:
-            match = pred_data['match']
-            prediction = pred_data['prediction']
-            
-            probs = json.loads(prediction['probabilities']) if isinstance(prediction['probabilities'], str) else prediction['probabilities']
-            
-            text = (
-                f"🔥 <b>УВЕРЕННЫЙ ПРОГНОЗ ({prediction['confidence']}%)</b>\n\n"
-                f"🏆 <b>{match['team1']} — {match['team2']}</b>\n"
-                f"📅 {match['date']}\n\n"
-                f"🧠 <b>Анализ:</b>\n{prediction['analysis']}\n\n"
-                f"📊 <b>Вероятности:</b>\n"
-                f"П1: {probs.get('team1_win', 0)}% | X: {probs.get('draw', 0)}% | П2: {probs.get('team2_win', 0)}%\n\n"
-                f"💰 <b>Рекомендация:</b> {prediction['recommended_bet']}\n\n"
-                f"⚠️ <i>Помните, что ставки - это риск. Играйте ответственно.</i>"
-            )
-            
-            for user_id in users:
-                try:
-                    await bot.send_message(user_id, text, parse_mode="HTML")
-                except TelegramBadRequest as e:
-                    if "bot was blocked" in str(e) or "chat not found" in str(e):
-                        await remove_user(user_id)
-                        logger.info(f"🗑 Удален заблокированный пользователь {user_id}")
-                except Exception as e:
-                    logger.error(f"❌ Ошибка отправки пользователю {user_id}: {e}")
+        for match in fb + hk + es:
+            try:
+                pred = await analyze_match(match)
+                if pred['confidence'] >= MIN_CONFIDENCE:
+                    await save_prediction(
+                        match['id'], match['sport'],
+                        pred['analysis'], pred['probabilities'],
+                        pred['recommendation'], pred['confidence'],
+                        pred['bet_type']
+                    )
+            except:
+                pass
+        
+        predictions = await get_unsent_predictions(limit=PREDICTIONS_PER_HOUR)
     
-    logger.info("✅ Ежедневный анализ завершен")
+    if not predictions:
+        logger.info("Нет новых прогнозов для рассылки")
+        return
+    
+    logger.info(f"📤 Рассылка {len(predictions)} прогнозов {len(users)} пользователям")
+    
+    for pred in predictions:
+        match_id, sport, analysis, probs_json, rec, conf, bet_type = pred
+        probs = json.loads(probs_json)
+        
+        sport_emoji = {'football': '️', 'hockey': '🏒', 'esports': '🎮'}.get(sport, '🏆')
+        
+        text = (
+            f"{sport_emoji} <b>ПРОГНОЗ ({conf}%)</b>\n\n"
+            f" <b>Рекомендация:</b> {rec}\n"
+            f" <b>Тип ставки:</b> {bet_type}\n\n"
+            f" <b>Вероятности:</b>\n"
+            f"• П1: {probs.get('p1', 0)}%\n"
+            f"• Ничья: {probs.get('x', 0)}%\n"
+            f"• П2: {probs.get('p2', 0)}%\n"
+            f"• ТБ 2.5: {probs.get('total_over_2.5', 0)}%\n\n"
+            f" <b>Метод:</b> {probs.get('method', 'Математический анализ')}\n\n"
+            f"⚠️ <i>Играйте ответственно!</i>"
+        )
+        
+        for user_id in users:
+            try:
+                await bot.send_message(user_id, text, parse_mode="HTML")
+                await mark_prediction_sent(match_id, user_id)
+            except Exception as e:
+                logger.error(f"Ошибка отправки {user_id}: {e}")
+    
+    logger.info("✅ Рассылка завершена")
+
 
 def setup_scheduler():
-    """Настройка планировщика задач"""
     scheduler = AsyncIOScheduler()
     
-    # Запускаем анализ каждый день в 10:00 утра
+    # Ежечасная рассылка (каждый час)
     scheduler.add_job(
-        daily_analysis_job,
-        CronTrigger(hour=10, minute=0),
-        id="daily_analysis",
-        name="Ежедневный анализ матчей"
+        hourly_predictions_job,
+        IntervalTrigger(hours=1),
+        id="hourly_predictions",
+        name="Ежечасная рассылка прогнозов"
+    )
+    
+    # Ежедневный сбор данных в 02:00 МСК
+    scheduler.add_job(
+        lambda: logger.info("📊 Ежедневный сбор данных"),
+        CronTrigger(hour=2, minute=0, timezone='Europe/Moscow'),
+        id="daily_data_collection"
     )
     
     scheduler.start()
-    logger.info("⏰ Планировщик запущен. Следующий запуск в 10:00")
+    logger.info("⏰ Планировщик запущен")
     return scheduler
 
-# ==================== 6. ОБРАБОТЧИКИ БОТА ====================
+
+# ==================== ИНТЕРФЕЙС БОТА ====================
+
+def get_main_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Прогнозы на сегодня", callback_data="today")],
+        [InlineKeyboardButton(text="⚽️ Футбол", callback_data="sport_football")],
+        [InlineKeyboardButton(text="🏒 Хоккей", callback_data="sport_hockey")],
+        [InlineKeyboardButton(text="🎮 Киберспорт", callback_data="sport_esports")],
+        [InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")],
+        [InlineKeyboardButton(text="ℹ️ О боте", callback_data="about")],
+    ])
+
+def get_back_button():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=" Главное меню", callback_data="back_to_start")]
+    ])
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    """Обработчик команды /start"""
     await add_user(message.from_user.id, message.from_user.username or "unknown")
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📅 Прогнозы на сегодня", callback_data="today_matches")],
-        [InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")],
-        [InlineKeyboardButton(text="ℹ️ О боте", callback_data="about")]
-    ])
-    
-    await message.answer(
-        f"👋 Привет, {message.from_user.first_name}!\n\n"
-        f"Я — бот-аналитик спортивных ставок. Я не копирую чужие прогнозы, а сам анализирую данные и считаю вероятности.\n\n"
-        f"🎯 <b>Как я работаю:</b>\n"
-        f"• Собираю факты: форма, травмы, мотивация, статистика\n"
-        f"• Анализирую данные с помощью ИИ\n"
-        f"• Считаю вероятности исходов\n"
-        f"• Рекомендую ставки ТОЛЬКО если уверенность ≥ {MIN_CONFIDENCE}%\n\n"
-        f"⏰ <b>Автоматическая рассылка:</b>\n"
-        f"Каждый день в 10:00 я буду присылать тебе самые надежные прогнозы!\n\n"
-        f"🏆 <b>Поддерживаемые виды спорта:</b>\n"
-        f"⚽️ Футбол\n"
-        f"🏒 Хоккей\n"
-        f"🎮 Киберспорт",
-        parse_mode="HTML",
-        reply_markup=kb
+    text = (
+        f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
+        f"🤖 Я — <b>ML-бот для спортивных прогнозов</b>\n\n"
+        f" <b>Как я работаю:</b>\n"
+        f"• Использую <b>4 математические модели</b>:\n"
+        f"  - Модель Пуассона (голы)\n"
+        f"  - Рейтинг Эло (сила команд)\n"
+        f"  - Модель Брэдли-Терри (парные сравнения)\n"
+        f"  - Анализ формы команд\n"
+        f"• Объединяю их в <b>ансамбль</b>\n"
+        f"• Рассчитываю вероятности исходов\n"
+        f"• Даю прогнозы с уверенностью ≥ {MIN_CONFIDENCE}%\n\n"
+        f"⏰ <b>Рассылка:</b>\n"
+        f"3 прогноза каждый час, без повторений!\n\n"
+        f"🏆 <b>Виды спорта:</b>\n"
+        f"⚽️ Футбол |  Хоккей | 🎮 Киберспорт"
     )
+    
+    await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
-@dp.callback_query(F.data == "today_matches")
-async def show_today_matches(callback: types.CallbackQuery):
-    """Показать прогнозы на сегодня"""
+
+@dp.callback_query(F.data == "back_to_start")
+async def back_to_start(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        "🏠 <b>Главное меню</b>\n\nВыберите раздел:",
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "today")
+async def show_today(callback: types.CallbackQuery):
     await callback.answer("⏳ Загружаю прогнозы...")
     
     predictions = await get_today_predictions()
     
     if not predictions:
         await callback.message.edit_text(
-            "😔 На сегодня пока нет уверенных прогнозов.\n\n"
-            "Возможно, анализ еще не проведен или все матчи имеют низкую уверенность (< 60%).\n\n"
-            "Попробуйте заглянуть позже или дождитесь автоматической рассылки в 10:00."
+            "😔 На сегодня пока нет прогнозов.\n\n"
+            "Попробуйте позже или дождитесь следующей рассылки.",
+            reply_markup=get_back_button()
         )
         return
     
-    text = f"🔥 <b>Прогнозы на сегодня ({len(predictions)} шт.)</b>\n\n"
+    text = f"📅 <b>Прогнозы на сегодня ({len(predictions)} шт.)</b>\n\n"
     
-    for pred in predictions[:5]:  # Показываем максимум 5
-        match_id = pred[0]
-        sport = pred[1]
-        analysis = pred[2]
-        probs = json.loads(pred[3])
-        recommendation = pred[4]
-        confidence = pred[5]
-        
-        sport_emoji = {"football": "⚽️", "hockey": "🏒", "esports": "🎮"}.get(sport, "🏆")
-        
-        text += (
-            f"{sport_emoji} <b>{recommendation}</b> ({confidence}%)\n"
-            f"<i>{analysis[:100]}...</i>\n\n"
+    for i, pred in enumerate(predictions[:5], 1):
+        match_id, sport, analysis, probs_json, rec, conf, bet_type = pred
+        sport_emoji = {'football': '⚽️', 'hockey': '🏒', 'esports': ''}.get(sport, '🏆')
+        text += f"{i}. {sport_emoji} <b>{rec}</b> ({conf}%)\n   Тип: {bet_type}\n\n"
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_back_button())
+
+
+@dp.callback_query(F.data.startswith("sport_"))
+async def show_sport(callback: types.CallbackQuery):
+    sport = callback.data.split("_")[1]
+    sport_names = {'football': '⚽️ Футбол', 'hockey': '🏒 Хоккей', 'esports': '🎮 Киберспорт'}
+    
+    await callback.answer(" Анализирую матчи...")
+    
+    if sport == 'football':
+        matches = await fetch_football_matches()
+    elif sport == 'hockey':
+        matches = await fetch_hockey_matches()
+    else:
+        matches = await fetch_esports_matches()
+    
+    if not matches:
+        await callback.message.edit_text(
+            f"😔 Нет матчей по разделу {sport_names[sport]}",
+            reply_markup=get_back_button()
         )
+        return
     
-    text += "\n💡 <i>Полные прогнозы с детальным анализом приходят в утренней рассылке.</i>"
+    text = f"{sport_names[sport]} - <b>{len(matches)} матчей</b>\n\n"
     
-    await callback.message.edit_text(text, parse_mode="HTML")
+    # Проанализировать и показать лучшие
+    analyzed = []
+    for match in matches:
+        try:
+            pred = await analyze_match(match)
+            if pred['confidence'] >= MIN_CONFIDENCE:
+                analyzed.append((match, pred))
+        except:
+            pass
+    
+    if not analyzed:
+        text += "Нет уверенных прогнозов (≥ 50%)\n\n"
+    else:
+        text += f"✅ Найдено {len(analyzed)} прогнозов:\n\n"
+        for match, pred in analyzed[:5]:
+            text += (
+                f"🏆 <b>{match['team1']} vs {match['team2']}</b>\n"
+                f"💰 {pred['recommendation']} ({pred['confidence']}%)\n"
+                f" Тип: {pred['bet_type']}\n\n"
+            )
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_back_button())
+
 
 @dp.callback_query(F.data == "my_stats")
-async def show_my_stats(callback: types.CallbackQuery):
-    """Показать статистику пользователя"""
-    await callback.answer("⏳ Загружаю статистику...")
+async def show_stats(callback: types.CallbackQuery):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM predictions WHERE confidence >= ?", 
+            (MIN_CONFIDENCE,)
+        ) as cursor:
+            total = (await cursor.fetchone())[0]
     
-    # В реальности здесь можно считать ROI, количество полученных прогнозов и т.д.
-    await callback.message.edit_text(
+    text = (
         "📊 <b>Ваша статистика</b>\n\n"
-        "📅 Дата регистрации: сегодня\n"
-        "📨 Получено прогнозов: 0\n"
-        "✅ Успешных ставок: N/A\n"
-        "📈 ROI: N/A\n\n"
-        "<i>Статистика будет доступна после того, как вы начнете использовать прогнозы.</i>",
-        parse_mode="HTML"
+        f"📅 Дата регистрации: сегодня\n"
+        f"📨 Всего прогнозов в базе: {total}\n"
+        f"🎯 Порог уверенности: ≥ {MIN_CONFIDENCE}%\n"
+        f"⏰ Рассылка: 3 прогноза/час\n\n"
+        f"<i>Статистика ставок будет доступна после использования прогнозов.</i>"
     )
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_back_button())
+
 
 @dp.callback_query(F.data == "about")
 async def show_about(callback: types.CallbackQuery):
-    """Показать информацию о боте"""
-    await callback.message.edit_text(
+    text = (
         "ℹ️ <b>О боте</b>\n\n"
-        "Этот бот использует искусственный интеллект для анализа спортивных событий.\n\n"
-        "🧠 <b>Как работает анализ:</b>\n"
-        "1. Собираем данные из официальных API\n"
-        "2. Передаем факты в нейросеть GPT-4\n"
-        "3. ИИ анализирует форму, травмы, мотивацию\n"
-        "4. Считаем вероятности исходов\n"
-        "5. Рекомендуем ставки только при уверенности ≥ 60%\n\n"
-        "⚠️ <b>Важно:</b>\n"
-        "Ставки на спорт связаны с риском. Играйте ответственно и только на те суммы, которые готовы потерять.\n\n"
-        "🔧 <b>Технологии:</b>\n"
-        "• Python + aiogram\n"
-        "• OpenAI GPT-4\n"
-        "• SQLite\n"
-        "• APScheduler",
-        parse_mode="HTML"
+        "🧮 <b>Математические модели:</b>\n\n"
+        f"1️⃣ <b>Модель Пуассона</b>\n"
+        f"   Расчёт вероятности голов через распределение Пуассона\n\n"
+        f"2️ <b>Рейтинг Эло</b>\n"
+        f"   Система рейтингов как в шахматах\n\n"
+        f"3️⃣ <b>Модель Брэдли-Терри</b>\n"
+        f"   Парные сравнения команд\n\n"
+        f"4️⃣ <b>Анализ формы</b>\n"
+        f"   Последние результаты команд\n\n"
+        f"🎯 <b>Ансамбль</b> объединяет все модели с весами:\n"
+        f"• Пуассон: 35%\n"
+        f"• Эло: 25%\n"
+        f"• Брэдли-Терри: 20%\n"
+        f"• Форма: 20%\n\n"
+        f"⚠️ <i>Ставки — это риск. Играйте ответственно!</i>"
     )
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_back_button())
+
+
+@dp.message(Command("first_train"))
+async def cmd_first_train(message: types.Message):
+    """Команда для первого обучения"""
+    await first_train(message)
+
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
-    """Обработчик команды /help"""
-    await message.answer(
+    text = (
         "📖 <b>Команды бота:</b>\n\n"
-        "/start — Начать работу с ботом\n"
-        "/help — Показать справку\n\n"
-        "🎯 <b>Возможности:</b>\n"
-        "• Автоматическая рассылка прогнозов в 10:00\n"
-        "• Анализ футбола, хоккея, киберспорта\n"
-        "• Прогнозы только с уверенностью ≥ 60%\n\n"
-        "💡 Используйте кнопки меню для навигации.",
-        parse_mode="HTML"
+        "/start — Главное меню\n"
+        "/first_train — Первое обучение моделей\n"
+        "/help — Справка\n\n"
+        "💡 Используйте кнопки для навигации"
     )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_back_button())
 
-# ==================== 7. ГЛАВНЫЙ ЗАПУСК ====================
+
+# ==================== ЗАПУСК ====================
+
 async def main():
-    """Главная функция запуска бота"""
     logger.info("🚀 Запуск бота...")
     
-    # 1. Инициализируем БД
     await init_db()
+    logger.info("✅ База данных инициализирована")
     
-    # 2. Запускаем планировщик
     scheduler = setup_scheduler()
     
-    # 3. Запускаем бота
-    logger.info("✅ Бот успешно запущен и готов к работе!")
-    logger.info("⏰ Ожидание команд пользователей и триггеров планировщика...")
+    # Автоматическое первое обучение если база пустая
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT COUNT(*) FROM predictions") as cursor:
+            count = (await cursor.fetchone())[0]
     
-    try:
-        await dp.start_polling(bot)
-    finally:
-        scheduler.shutdown()
-        await bot.session.close()
+    if count == 0:
+        logger.info(" База пустая - запускаю первое обучение...")
+        await first_train()
+    
+    logger.info("✅ Бот готов к работе!")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("🛑 Бот остановлен пользователем")
+        logger.info("🛑 Бот остановлен")
