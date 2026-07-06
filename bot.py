@@ -684,6 +684,24 @@ async def hourly_predictions_job():
     logger.info("✅ Рассылка завершена")
 
 
+def setup_scheduler():  
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.interval import IntervalTrigger
+    
+    scheduler = AsyncIOScheduler()
+    
+    scheduler.add_job(
+        hourly_predictions_job,
+        IntervalTrigger(hours=1),
+        id="hourly_predictions",
+        name="Ежечасная рассылка прогнозов"
+    )
+    
+    scheduler.start()
+    logger.info("⏰ Планировщик запущен")
+    return scheduler
+
+
 # ==================== ИНТЕРФЕЙС БОТА ====================
 
 def get_main_keyboard():
