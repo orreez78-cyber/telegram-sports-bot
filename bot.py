@@ -746,16 +746,6 @@ async def cmd_start(message: types.Message):
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
-@dp.callback_query(F.data == "back_to_start")
-async def back_to_start(callback: types.CallbackQuery):
-    await callback.message.edit_text(
-        "🏠 <b>Главное меню</b>\n\nВыберите раздел:",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard()
-    )
-    await callback.answer()
-
-
 @dp.callback_query(F.data == "today")
 async def show_today(callback: types.CallbackQuery):
     await callback.answer("⏳ Загружаю прогнозы...")
@@ -772,12 +762,23 @@ async def show_today(callback: types.CallbackQuery):
     
     text = f"📅 <b>Прогнозы на сегодня ({len(predictions)} шт.)</b>\n\n"
     
-    for i, pred in enumerate(predictions[:5], 1):
-        match_id, sport, analysis, probs_json, rec, conf, bet_type, created_at = pred
+    for i, pred in enumerate(predictions[:10], 1):  # Показываем до 10 прогнозов
+        match_id, sport, analysis, probs_json, rec, conf, bet_type = pred
         sport_emoji = {'football': '⚽️', 'hockey': '🏒', 'esports': '🎮'}.get(sport, '🏆')
-        text += f"{i}. {sport_emoji} <b>{rec}</b> ({conf}%)\n   Тип: {bet_type}\n\n"
+        
+        # Извлекаем название матча из рекомендации
+        # Формат рекомендации: "П1 (Арсенал)" или "Тотал больше 2.5"
+        match_name = ""
+        if "(" in rec and ")" in rec:
+            match_name = rec.split("(")[1].split(")")[0]
+        
+        text += f"{i}. {sport_emoji} <b>{match_name}</b>\n"
+        text += f"   💰 {rec}\n"
+        text += f"   🎯 Тип: {bet_type}\n"
+        text += f"   📊 Уверенность: {conf}%\n\n"
     
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_back_button())
+
 
 
 @dp.callback_query(F.data.startswith("sport_"))
