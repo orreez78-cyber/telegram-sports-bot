@@ -619,6 +619,7 @@ async def first_train(message: types.Message = None):
 # ==================== ПЛАНИРОВЩИК ====================
 
 async def hourly_predictions_job():
+    """Ежечасная рассылка 3 прогнозов"""
     logger.info("🕐 Запуск ежечасной рассылки...")
     
     users = await get_all_users()
@@ -655,7 +656,7 @@ async def hourly_predictions_job():
     logger.info(f"📤 Рассылка {len(predictions)} прогнозов {len(users)} пользователям")
     
     for pred in predictions:
-       match_id, sport, analysis, probs_json, rec, conf, bet_type, created_at = pred
+        match_id, sport, analysis, probs_json, rec, conf, bet_type, created_at = pred
         probs = json.loads(probs_json)
         
         sport_emoji = {'football': '⚽️', 'hockey': '🏒', 'esports': '🎮'}.get(sport, '🏆')
@@ -681,21 +682,6 @@ async def hourly_predictions_job():
                 logger.error(f"Ошибка отправки {user_id}: {e}")
     
     logger.info("✅ Рассылка завершена")
-
-
-def setup_scheduler():
-    scheduler = AsyncIOScheduler()
-    
-    scheduler.add_job(
-        hourly_predictions_job,
-        IntervalTrigger(hours=1),
-        id="hourly_predictions",
-        name="Ежечасная рассылка прогнозов"
-    )
-    
-    scheduler.start()
-    logger.info("⏰ Планировщик запущен")
-    return scheduler
 
 
 # ==================== ИНТЕРФЕЙС БОТА ====================
