@@ -478,21 +478,18 @@ async def fetch_api_football_matches():
                     data = await resp.json()
                     matches = []
                     for f in data.get('response', []):
-                        matches.append({
-                            "id": f"af_{f['fixture']['id']}",
-                            "team1": f['teams']['home']['name'],
-                            "team2": f['teams']['away']['name'],
-                            "date": f['fixture']['date'],
-                            "sport": "football",
-                            "tournament": f['league']['name'],
-                            "team1_goals_avg': 1.5,
-                            "team2_goals_avg': 1.5,
-                            "team1_elo": 1500,
-                            "team2_elo": 1500,
-                            "team1_strength": 50,
-                            "team2_strength": 50,
-                            "team1_form": 50,
-                            "team2_form": 50
+                       matches.append({
+    "id": f"af_{f['fixture']['id']}",
+    "team1": f['teams']['home']['name'],
+    "team2": f['teams']['away']['name'],
+    "date": f['fixture']['date'],
+    "sport": "football",
+    "tournament": f['league']['name'],
+    "team1_goals_avg": 1.5,  # ← ИСПРАВЛЕНО!
+    "team2_goals_avg": 1.5,  # ← ИСПРАВЛЕНО!
+    "team1_elo": 1500,
+    "team2_elo": 1500,
+    ...
                         })
                     return matches
     except Exception as e:
