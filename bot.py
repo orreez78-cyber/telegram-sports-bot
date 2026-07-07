@@ -1046,6 +1046,26 @@ async def analyze_match(match):
 
 # ==================== АВТОМАТИЧЕСКОЕ ОБУЧЕНИЕ ====================
 
+   async def first_train(message: types.Message = None):
+    """Первое обучение моделей"""
+    async def send(msg):
+        if message:
+            try:
+                await message.answer(msg)
+            except Exception as e:
+                logger.error(f"Ошибка отправки: {e}")
+        logger.info(msg)
+    
+    await send("🚀 Начинаю первое обучение моделей...")
+    
+    await send("📊 Собираю данные из 4 источников...")
+    fb_matches = await fetch_football_matches()
+    hk_matches = await fetch_hockey_matches()
+    es_matches = await fetch_esports_matches()
+    
+    all_matches = fb_matches + hk_matches + es_matches
+    await send(f"✅ Собрано {len(all_matches)} матчей")
+    
     await send("📈 Рассчитываю рейтинги команд...")
     for match in all_matches:
         await save_team_rating(
@@ -1061,7 +1081,6 @@ async def analyze_match(match):
             match.get('team2_goals_avg', 1.5)
         )
         
-        # Сохраняем матч в БД
         async with aiosqlite.connect(DB_NAME) as db:
             await db.execute("""INSERT OR REPLACE INTO matches 
                 (match_id, sport, team1, team2, match_date, tournament)
@@ -1101,7 +1120,6 @@ async def analyze_match(match):
     await send(f"📊 Создано {predictions_count} прогнозов с уверенностью ≥ {MIN_CONFIDENCE}%")
     
     return predictions_count
-
 
 # ==================== ПЛАНИРОВЩИК ====================
 
