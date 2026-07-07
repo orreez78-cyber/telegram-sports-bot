@@ -478,18 +478,21 @@ async def fetch_api_football_matches():
                     data = await resp.json()
                     matches = []
                     for f in data.get('response', []):
-                       matches.append({
-    "id": f"af_{f['fixture']['id']}",
-    "team1": f['teams']['home']['name'],
-    "team2": f['teams']['away']['name'],
-    "date": f['fixture']['date'],
-    "sport": "football",
-    "tournament": f['league']['name'],
-    "team1_goals_avg": 1.5,  # ← ИСПРАВЛЕНО!
-    "team2_goals_avg": 1.5,  # ← ИСПРАВЛЕНО!
-    "team1_elo": 1500,
-    "team2_elo": 1500,
-    ...
+                        matches.append({
+                            "id": f"af_{f['fixture']['id']}",
+                            "team1": f['teams']['home']['name'],
+                            "team2": f['teams']['away']['name'],
+                            "date": f['fixture']['date'],
+                            "sport": "football",
+                            "tournament": f['league']['name'],
+                            "team1_goals_avg": 1.5,
+                            "team2_goals_avg": 1.5,
+                            "team1_elo": 1500,
+                            "team2_elo": 1500,
+                            "team1_strength": 50,
+                            "team2_strength": 50,
+                            "team1_form": 50,
+                            "team2_form": 50
                         })
                     return matches
     except Exception as e:
@@ -519,8 +522,8 @@ async def fetch_football_data_org_matches():
                                 "date": match['utcDate'],
                                 "sport": "football",
                                 "tournament": match.get('competition', {}).get('name', 'Unknown'),
-                                "team1_goals_avg': 1.5,
-                                "team2_goals_avg': 1.5,
+                                "team1_goals_avg": 1.5,
+                                "team2_goals_avg": 1.5,
                                 "team1_elo": 1500,
                                 "team2_elo": 1500,
                                 "team1_strength": 50,
@@ -568,8 +571,8 @@ async def fetch_openligadb_matches():
                                     "league": league_name,
                                     "tournament": league_name,
                                     "sport": "football",
-                                    "team1_goals_avg': 1.5,
-                                    "team2_goals_avg': 1.5,
+                                    "team1_goals_avg": 1.5,
+                                    "team2_goals_avg": 1.5,
                                     "team1_elo": 1500,
                                     "team2_elo": 1500,
                                     "team1_strength": 50,
@@ -632,8 +635,8 @@ async def fetch_pandascore_matches():
                                         "tournament": match.get('league', {}).get('name', 'Unknown'),
                                         "sport": "esports",
                                         "format": match.get('series', {}).get('type', 'bo1'),
-                                        "team1_goals_avg': 1.3,
-                                        "team2_goals_avg': 1.2,
+                                        "team1_goals_avg": 1.3,
+                                        "team2_goals_avg": 1.2,
                                         "team1_elo": 1700,
                                         "team2_elo": 1650,
                                         "team1_strength": 70,
@@ -651,43 +654,25 @@ async def fetch_pandascore_matches():
     return all_matches
 
 
-async def fetch_football_matches():
-    logger.info("📊 Собираю футбольные матчи...")
-    
-    matches = []
-    
-    af_matches = await fetch_api_football_matches()
-    logger.info(f"API-Football: {len(af_matches)} матчей")
-    matches.extend(af_matches)
-    
-    fd_matches = await fetch_football_data_org_matches()
-    logger.info(f"Football-Data.org: {len(fd_matches)} матчей")
-    matches.extend(fd_matches)
-    
-    ol_matches = await fetch_openligadb_matches()
-    logger.info(f"OpenLigaDB: {len(ol_matches)} матчей")
-    matches.extend(ol_matches)
-    
-    unique_matches = {}
-    for match in matches:
-        key = f"{match['team1']}_{match['team2']}"
-        if key not in unique_matches:
-            unique_matches[key] = match
-    
-    logger.info(f"✅ Всего футбольных матчей: {len(unique_matches)}")
-    return list(unique_matches.values())
-
-
 async def fetch_hockey_matches():
     today = datetime.now().strftime("%Y-%m-%d")
     return [
-        {"id": "hk_301", "team1": "ЦСКА", "team2": "СКА",
-         "date": today, "sport": "hockey",
-         "tournament": "КХЛ",
-         "team1_goals_avg': 3.2, "team2_goals_avg': 2.8,
-         "team1_elo": 1750, "team2_elo": 1780,
-         "team1_strength": 72, "team2_strength": 75,
-         "team1_form": 70, "team2_form": 74},
+        {
+            "id": "hk_301",
+            "team1": "ЦСКА",
+            "team2": "СКА",
+            "date": today,
+            "sport": "hockey",
+            "tournament": "КХЛ",
+            "team1_goals_avg": 3.2,
+            "team2_goals_avg": 2.8,
+            "team1_elo": 1750,
+            "team2_elo": 1780,
+            "team1_strength": 72,
+            "team2_strength": 75,
+            "team1_form": 70,
+            "team2_form": 74
+        },
     ]
 
 
@@ -700,19 +685,28 @@ async def fetch_esports_matches():
     if not matches:
         today = datetime.now().strftime("%Y-%m-%d")
         mock_matches = [
-            {"id": "es_201", "team1": "NaVi", "team2": "FaZe",
-             "date": today, "sport": "esports", "game": "CS2",
-             "tournament": "IEM Katowice 2026",
-             "team1_goals_avg': 1.3, "team2_goals_avg': 1.2,
-             "team1_elo": 1800, "team2_elo": 1780,
-             "team1_strength": 80, "team2_strength": 78,
-             "team1_form": 75, "team2_form": 72},
+            {
+                "id": "es_201",
+                "team1": "NaVi",
+                "team2": "FaZe",
+                "date": today,
+                "sport": "esports",
+                "game": "CS2",
+                "tournament": "IEM Katowice 2026",
+                "team1_goals_avg": 1.3,
+                "team2_goals_avg": 1.2,
+                "team1_elo": 1800,
+                "team2_elo": 1780,
+                "team1_strength": 80,
+                "team2_strength": 78,
+                "team1_form": 75,
+                "team2_form": 72
+            },
         ]
         matches.extend(mock_matches)
         logger.info(f"Используем мок-данные: {len(mock_matches)} матчей")
     
     return matches
-
 
 # ==================== АНАЛИЗАТОР ====================
 
