@@ -587,6 +587,37 @@ async def fetch_openligadb_matches():
     
     return all_matches
 
+async def fetch_football_matches():
+    """Собрать все футбольные матчи из всех источников"""
+    logger.info("📊 Собираю футбольные матчи...")
+    
+    matches = []
+    
+    # 1. API-Football
+    af_matches = await fetch_api_football_matches()
+    logger.info(f"API-Football: {len(af_matches)} матчей")
+    matches.extend(af_matches)
+    
+    # 2. Football-Data.org
+    fd_matches = await fetch_football_data_org_matches()
+    logger.info(f"Football-Data.org: {len(fd_matches)} матчей")
+    matches.extend(fd_matches)
+    
+    # 3. OpenLigaDB
+    ol_matches = await fetch_openligadb_matches()
+    logger.info(f"OpenLigaDB: {len(ol_matches)} матчей")
+    matches.extend(ol_matches)
+    
+    # Удаляем дубликаты
+    unique_matches = {}
+    for match in matches:
+        key = f"{match['team1']}_{match['team2']}"
+        if key not in unique_matches:
+            unique_matches[key] = match
+    
+    logger.info(f"✅ Всего футбольных матчей: {len(unique_matches)}")
+    return list(unique_matches.values())
+
 
 async def fetch_pandascore_matches():
     if not PANDASCORE_API_KEY:
@@ -652,6 +683,38 @@ async def fetch_pandascore_matches():
         await asyncio.sleep(1)
     
     return all_matches
+
+
+async def fetch_football_matches():
+    """Собрать все футбольные матчи из всех источников"""
+    logger.info("📊 Собираю футбольные матчи...")
+    
+    matches = []
+    
+    # 1. API-Football
+    af_matches = await fetch_api_football_matches()
+    logger.info(f"API-Football: {len(af_matches)} матчей")
+    matches.extend(af_matches)
+    
+    # 2. Football-Data.org
+    fd_matches = await fetch_football_data_org_matches()
+    logger.info(f"Football-Data.org: {len(fd_matches)} матчей")
+    matches.extend(fd_matches)
+    
+    # 3. OpenLigaDB
+    ol_matches = await fetch_openligadb_matches()
+    logger.info(f"OpenLigaDB: {len(ol_matches)} матчей")
+    matches.extend(ol_matches)
+    
+    # Удаляем дубликаты
+    unique_matches = {}
+    for match in matches:
+        key = f"{match['team1']}_{match['team2']}"
+        if key not in unique_matches:
+            unique_matches[key] = match
+    
+    logger.info(f"✅ Всего футбольных матчей: {len(unique_matches)}")
+    return list(unique_matches.values())
 
 
 async def fetch_hockey_matches():
