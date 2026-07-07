@@ -1063,25 +1063,25 @@ async def first_train(message: types.Message = None):
     es_matches = await fetch_esports_matches()
     
     all_matches = fb_matches + hk_matches + es_matches
-    await send(f"✅ Собрано {len(all_matches)} матчей")
-    
-    await send("📈 Рассчитываю рейтинги команд...")
-    for match in all_matches:
-        await save_team_rating(
-            f"{match['sport']}_{match['team1']}", match['sport'],
-            match.get('team1_elo', 1500),
-            match.get('team1_strength', 50),
-            match.get('team1_goals_avg', 1.5)
-        )
-        await save_team_rating(
-            f"{match['sport']}_{match['team2']}", match['sport'],
-            match.get('team2_elo', 1500),
-            match.get('team2_strength', 50),
-            match.get('team2_goals_avg', 1.5)
-        )
-        
-        # Сохраняем матч в БД
-            await send("🧮 Анализирую матчи математическими моделями...")
+    await send("✅ Собрано {len(all_matches)} матчей")
+
+await send(" Рассчитываю рейтинги команд...")
+
+for match in all_matches:
+    await save_team_rating(...)  # Первый рейтинг
+    await save_team_rating(...)  # Второй рейтинг
+    # Сохраняем матч в БД
+
+# ← ПЕРЕМЕСТИТЕ СЮДА (после цикла сохранения рейтингов)
+await send("🧮 Анализирую матчи математическими моделями...")
+
+predictions_count = 0
+debug_count = 0
+
+for match in all_matches:
+    try:
+        prediction = await analyze_match(match)
+        # ... анализ ...
     predictions_count = 0
     debug_count = 0
     
