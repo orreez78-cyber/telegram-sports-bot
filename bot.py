@@ -1046,7 +1046,7 @@ async def analyze_match(match):
 
 # ==================== АВТОМАТИЧЕСКОЕ ОБУЧЕНИЕ ====================
 
-   async def first_train(message: types.Message = None):
+async def first_train(message: types.Message = None):
     """Первое обучение моделей"""
     async def send(msg):
         if message:
