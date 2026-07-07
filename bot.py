@@ -23,7 +23,7 @@ FOOTBALL_DATA_ORG_KEY = os.getenv("FOOTBALL_DATA_ORG_KEY", "32fcb5cfa8c64b40b4ba
 PANDASCORE_API_KEY = os.getenv("PANDASCORE_API_KEY", "aXVsIwT4FSLepT021v4nrPAW9i-W-5y8Au0rrvUc4wg7bSf8IlY")  
 HOCKEY_API_KEY = os.getenv("HOCKEY_API_KEY", "123")
 
-MIN_CONFIDENCE = 50
+MIN_CONFIDENCE = 45
 PREDICTIONS_PER_HOUR = 3
 DB_NAME = "sports_bot.db"
 
@@ -167,11 +167,11 @@ class EnsemblePredictor:
     
     def __init__(self):
         self.weights_sports = {
-            'poisson': 0.30,
-            'elo': 0.20,
+            'poisson': 0.40,
+            'elo': 0.25,
             'bradley_terry': 0.15,
             'form': 0.20,
-            'bookmaker': 0.15
+            'bookmaker': 0.10
         }
         
         self.weights_esports = {
@@ -1091,23 +1091,29 @@ async def first_train(message: types.Message = None):
     
     await send("🧮 Анализирую матчи...")
     predictions_count = 0
+    debug_count = 0
     
     for match in all_matches:
         try:
             prediction = await analyze_match(match)
+
             
-            if prediction['confidence'] >= MIN_CONFIDENCE:
-                await save_prediction(
-                    match['id'], match['sport'],
-                    match['team1'], match['team2'],
-                    match.get('tournament', 'Unknown'),
-                    prediction['analysis'],
-                    prediction['probabilities'],
-                    prediction['recommendation'],
-                    prediction['confidence'],
-                    prediction['bet_type']
-                )
-                predictions_count += 1
+          debug_count += 1
+if debug_count <= 5:
+    logger.info(f"🔍 {match['team1']} vs {match['team2']}: {prediction['confidence']}% ({prediction['recommendation']})")
+    
+    if prediction['confidence'] >= MIN_CONFIDENCE:
+        await save_prediction(
+            match['id'], match['sport'],
+            match['team1'], match['team2'],
+            match.get('tournament', 'Unknown'),
+            prediction['analysis'],
+            prediction['probabilities'],
+            prediction['recommendation'],
+            prediction['confidence'],
+            prediction['bet_type']
+        )
+        predictions_count += 1
         except Exception as e:
             logger.error(f"Ошибка анализа {match['team1']} vs {match['team2']}: {e}")
     
