@@ -1094,28 +1094,27 @@ async def first_train(message: types.Message = None):
     debug_count = 0
     
     for match in all_matches:
-        try:
-            prediction = await analyze_match(match)
-
-            
-          debug_count += 1
-if debug_count <= 5:
-    logger.info(f"🔍 {match['team1']} vs {match['team2']}: {prediction['confidence']}% ({prediction['recommendation']})")
-    
-    if prediction['confidence'] >= MIN_CONFIDENCE:
-        await save_prediction(
-            match['id'], match['sport'],
-            match['team1'], match['team2'],
-            match.get('tournament', 'Unknown'),
-            prediction['analysis'],
-            prediction['probabilities'],
-            prediction['recommendation'],
-            prediction['confidence'],
-            prediction['bet_type']
-        )
-        predictions_count += 1
-        except Exception as e:
-            logger.error(f"Ошибка анализа {match['team1']} vs {match['team2']}: {e}")
+    try:
+        prediction = await analyze_match(match)
+        
+        debug_count += 1
+        if debug_count <= 5:
+            logger.info(f"🔍 {match['team1']} vs {match['team2']}: {prediction['confidence']}% ({prediction['recommendation']})")
+        
+        if prediction['confidence'] >= MIN_CONFIDENCE:
+            await save_prediction(
+                match['id'], match['sport'],
+                match['team1'], match['team2'],
+                match.get('tournament', 'Unknown'),
+                prediction['analysis'],
+                prediction['probabilities'],
+                prediction['recommendation'],
+                prediction['confidence'],
+                prediction['bet_type']
+            )
+            predictions_count += 1
+    except Exception as e:
+        logger.error(f"Ошибка анализа {match['team1']} vs {match['team2']}: {e}")
     
     await send(f"✅ Обучение завершено!")
     await send(f"📊 Создано {predictions_count} прогнозов с уверенностью ≥ {MIN_CONFIDENCE}%")
