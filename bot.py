@@ -1081,40 +1081,32 @@ async def first_train(message: types.Message = None):
         )
         
         # Сохраняем матч в БД
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("""INSERT OR REPLACE INTO matches 
-                (match_id, sport, team1, team2, match_date, tournament)
-                VALUES (?, ?, ?, ?, ?, ?)""",
-                (match['id'], match['sport'], match['team1'], match['team2'], 
-                 match.get('date', ''), match.get('tournament', 'Unknown')))
-            await db.commit()
-    
-    await send("🧮 Анализирую матчи...")
+            await send("🧮 Анализирую матчи математическими моделями...")
     predictions_count = 0
     debug_count = 0
     
     for match in all_matches:
-    try:
-        prediction = await analyze_match(match)
-        
-        debug_count += 1
-        if debug_count <= 5:
-            logger.info(f"🔍 {match['team1']} vs {match['team2']}: {prediction['confidence']}% ({prediction['recommendation']})")
-        
-        if prediction['confidence'] >= MIN_CONFIDENCE:
-            await save_prediction(
-                match['id'], match['sport'],
-                match['team1'], match['team2'],
-                match.get('tournament', 'Unknown'),
-                prediction['analysis'],
-                prediction['probabilities'],
-                prediction['recommendation'],
-                prediction['confidence'],
-                prediction['bet_type']
-            )
-            predictions_count += 1
-    except Exception as e:
-        logger.error(f"Ошибка анализа {match['team1']} vs {match['team2']}: {e}")
+        try:
+            prediction = await analyze_match(match)
+            
+            debug_count += 1
+            if debug_count <= 5:
+                logger.info(f"🔍 {match['team1']} vs {match['team2']}: {prediction['confidence']}% ({prediction['recommendation']})")
+            
+            if prediction['confidence'] >= MIN_CONFIDENCE:
+                await save_prediction(
+                    match['id'], match['sport'],
+                    match['team1'], match['team2'],
+                    match.get('tournament', 'Unknown'),
+                    prediction['analysis'],
+                    prediction['probabilities'],
+                    prediction['recommendation'],
+                    prediction['confidence'],
+                    prediction['bet_type']
+                )
+                predictions_count += 1
+        except Exception as e:
+            logger.error(f"Ошибка анализа {match['team1']} vs {match['team2']}: {e}")
     
     await send(f"✅ Обучение завершено!")
     await send(f"📊 Создано {predictions_count} прогнозов с уверенностью ≥ {MIN_CONFIDENCE}%")
