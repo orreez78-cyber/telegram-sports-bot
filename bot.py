@@ -1046,42 +1046,31 @@ async def analyze_match(match):
 
 # ==================== АВТОМАТИЧЕСКОЕ ОБУЧЕНИЕ ====================
 
-async def first_train(message: types.Message = None):
-    async def send(msg):
-        if message:
-            try:
-                await message.answer(msg)
-            except Exception as e:
-                logger.error(f"Ошибка отправки: {e}")
-        logger.info(msg)
+    await send("📈 Рассчитываю рейтинги команд...")
+    for match in all_matches:
+        await save_team_rating(
+            f"{match['sport']}_{match['team1']}", match['sport'],
+            match.get('team1_elo', 1500),
+            match.get('team1_strength', 50),
+            match.get('team1_goals_avg', 1.5)
+        )
+        await save_team_rating(
+            f"{match['sport']}_{match['team2']}", match['sport'],
+            match.get('team2_elo', 1500),
+            match.get('team2_strength', 50),
+            match.get('team2_goals_avg', 1.5)
+        )
+        
+        # Сохраняем матч в БД
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("""INSERT OR REPLACE INTO matches 
+                (match_id, sport, team1, team2, match_date, tournament)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (match['id'], match['sport'], match['team1'], match['team2'], 
+                 match.get('date', ''), match.get('tournament', 'Unknown')))
+            await db.commit()
     
-    await send("🚀 Начинаю первое обучение моделей...")
-    
-    await send("📊 Собираю данные из 4 источников...")
-    fb_matches = await fetch_football_matches()
-    hk_matches = await fetch_hockey_matches()
-    es_matches = await fetch_esports_matches()
-    
-    all_matches = fb_matches + hk_matches + es_matches
-    await send("✅ Собрано {len(all_matches)} матчей")
-
-await send(" Рассчитываю рейтинги команд...")
-
-for match in all_matches:
-    await save_team_rating(...)  # Первый рейтинг
-    await save_team_rating(...)  # Второй рейтинг
-    # Сохраняем матч в БД
-
-# ← ПЕРЕМЕСТИТЕ СЮДА (после цикла сохранения рейтингов)
-await send("🧮 Анализирую матчи математическими моделями...")
-
-predictions_count = 0
-debug_count = 0
-
-for match in all_matches:
-    try:
-        prediction = await analyze_match(match)
-        # ... анализ ...
+    await send("🧮 Анализирую матчи математическими моделями...")
     predictions_count = 0
     debug_count = 0
     
