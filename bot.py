@@ -915,14 +915,38 @@ async def back_to_start(callback: types.CallbackQuery):
 async def show_bank(callback: types.CallbackQuery):
     db = await get_db()
     user_id = callback.from_user.id
+    
+    # Безопасное извлечение баланса
     async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
-        balance = (await cursor.fetchone())[0]
+        row = await cursor.fetchone()
+    
+    if not row:
+        # Если пользователя нет в базе — добавляем его
+        await add_user(user_id, callback.from_user.username or "unknown")
+        balance = INITIAL_VIRTUAL_BALANCE
+    else:
+        balance = row[0]
+        
+    # Безопасное извлечение статистики
     async with db.execute("SELECT COUNT(*) as total, SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) as won FROM virtual_bets WHERE user_id = ? AND status != 0", (user_id,)) as cursor:
         stats = await cursor.fetchone()
-    total_bets = stats[0] if stats else 0
-    won_bets = stats[1] if stats else 0
-    roi = round((won_bets / total_bets * 100), 1) if total_bets > 0 else 0
-    text = (f"💰 <b>Виртуальный банк</b>\n\n💵 Текущий баланс: <b>{balance:.2f} у.е.</b>\n📊 Разыграно ставок: {total_bets}\n✅ Выиграно: {won_bets}\n📈 Точность (ROI): {roi}%\n\nДелайте ставки на прогнозы, чтобы протестировать бота без риска!")
+        
+    if stats and stats[0] is not None:
+        total_bets = stats[0]
+        won_bets = stats[1] if stats[1] is not None else 0
+        roi = round((won_bets / total_bets * 100), 1) if total_bets > 0 else 0
+    else:
+        total_bets = 0
+        won_bets = 0
+        roi = 0
+        
+    text = (f"💰 <b>Виртуальный банк</b>\n\n"
+            f"💵 Текущий баланс: <b>{balance:.2f} у.е.</b>\n"
+            f"📊 Разыграно ставок: {total_bets}\n"
+            f"✅ Выиграно: {won_bets}\n"
+            f"📈 Точность (ROI): {roi}%\n\n"
+            f"Делайте ставки на прогнозы, чтобы протестировать бота без риска!")
+            
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_back_button())
     await callback.answer()
 
