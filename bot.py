@@ -285,6 +285,30 @@ class EsportsModel:
         p1 = max(20, min(80, (p1_elo * 0.40 + p1_strength * 0.30 + p1_form * 0.20 + 2 * 0.10)))
         return {'p1': round(p1, 1), 'p2': round(100 - p1, 1), 'method': 'Esports Model (Elo)'}
 
+class EsportsMapModel:
+    """Расчет тотала карт и фор для киберспорта (Bo3/Bo5)"""
+    @staticmethod
+    def calculate_maps(p1_map_prob, match_format):
+        p1 = p1_map_prob / 100.0
+        p2 = 1.0 - p1
+        results = {}
+        
+        if match_format == 3: # Bo3
+            p_3_maps = (2 * (p1**2) * p2) + (2 * (p2**2) * p1)
+            results['tb_2_5'] = round(p_3_maps * 100, 1)
+            results['f1_minus_1_5'] = round((p1**2) * 100, 1)       # П1 выиграет 2:0
+            results['f2_plus_1_5'] = round((1.0 - (p1**2)) * 100, 1) # П2 выиграет хотя бы 1 карту
+            results['f1_plus_1_5'] = round((1.0 - (p2**2)) * 100, 1) # П1 выиграет хотя бы 1 карту
+            results['f2_minus_1_5'] = round((p2**2) * 100, 1)       # П2 выиграет 2:0
+        elif match_format == 5: # Bo5
+            p_4_maps = (3 * (p1**3) * p2) + (3 * (p2**3) * p1)
+            p_5_maps = (6 * (p1**3) * (p2**2)) + (6 * (p2**3) * (p1**2))
+            results['tb_3_5'] = round((p_4_maps + p_5_maps) * 100, 1)
+            results['f1_minus_1_5'] = round((p1**3) * 100, 1)
+            results['f2_plus_1_5'] = round((1.0 - (p1**3)) * 100, 1)
+            
+        return results
+
 DEFAULT_ENSEMBLE_WEIGHTS = {'poisson': 0.35, 'bradley_terry': 0.25, 'form': 0.15, 'bookmaker': 0.25}
 
 class EnsemblePredictor:
@@ -476,14 +500,17 @@ async def fetch_pandascore_matches():
                     t1 = m['opponents'][0].get('opponent', {}).get('name', 'Unknown')
                     t2 = m['opponents'][1].get('opponent', {}).get('name', 'Unknown')
                     if t1 != 'Unknown' and t2 != 'Unknown':
-                        matches.append({"id": f"ps_{m['id']}", "team1": t1, "team2": t2, "date": m.get('begin_at', ''), "sport": "esports", "tournament": m.get('league', {}).get('name', 'Unknown')})
+                        match_format = m.get('series', {}).get('type', 3)
+                        matches.append({"id": f"ps_{m['id']}", "team1": t1, "team2": t2, "date": m.get('begin_at', ''), "sport": "esports", "tournament": m.get('league', {}).get('name', 'Unknown'), "format": match_format})
     _matches_cache.set("matches_esports", matches)
     return matches
 
 async def fetch_api_sport_hockey_matches():
     """Сбор хоккейных матчей напрямую из API-Sport (Hockey)"""
-    hockey_api_key = os.getenv("HOCKEY_API_SPORTS", "")
-    if not hockey_api_key: return []
+    hockey_api_key = os.getenv("HOCKEY_API_SPORTS", "6834e018-33cd-44c2-8195-a442fe73063d")
+    if not hockey_api_key: 
+        logger.warning("HOCKEY_API_SPORTS не задан в окружении. Использую мок-данные.")
+        return []
     
     url = "https://v1.hockey.api-sports.io/games"
     headers = {"x-apisports-key": hockey_api_key}
@@ -501,21 +528,19 @@ async def fetch_api_sport_hockey_matches():
                 "sport": "hockey",
                 "tournament": g['league']['name']
             })
+    elif data and data.get('errors'):
+        logger.error(f"Ошибка API-Sport Hockey: {data.get('errors')}")
     return matches
 
 async def fetch_hockey_matches():
     cache_key = "matches_hockey"
     cached = _matches_cache.get(cache_key)
     if cached: return cached
-    
     real_matches = await fetch_api_sport_hockey_matches()
     if real_matches:
         _matches_cache.set(cache_key, real_matches)
         return real_matches
-        
-    # Фолбэк на мок, если ключ не указан или API недоступно
-    today = datetime.now().strftime("%Y-%m-%d")
-    return [{"id": "hk_301", "team1": "ЦСКА", "team2": "СКА", "date": today, "sport": "hockey", "tournament": "КХЛ", "is_mock_source": True}]
+    return [{"id": "hk_301", "team1": "ЦСКА", "team2": "СКА", "date": datetime.now().strftime("%Y-%m-%d"), "sport": "hockey", "tournament": "КХЛ", "is_mock_source": True}]
 
 async def fetch_live_football_matches():
     if not FOOTBALL_API_KEY: return []
@@ -527,7 +552,6 @@ async def fetch_live_football_matches():
         for f in data.get('response', []):
             if f['league']['id'] in POPULAR_LIVE_LEAGUES:
                 live_matches.append({"id": f"af_{f['fixture']['id']}", "team1": f['teams']['home']['name'], "team2": f['teams']['away']['name'], "score1": f['goals']['home'] or 0, "score2": f['goals']['away'] or 0, "minute": f['fixture']['status']['elapsed'] or 0, "tournament": f['league']['name'], "sport": "football"})
-    # ИСПРАВЛЕНИЕ: Настраиваемый лимит через ENV
     limit = int(os.getenv("MAX_LIVE_FOOTBALL", 2))
     live_matches = live_matches[:limit]
     _live_cache.set("live_football", live_matches)
@@ -764,28 +788,51 @@ async def analyze_match(match):
     stats_for_ai = {'form1': t1['form'], 'form2': t2['form'], 'lambda1': lambda1, 'lambda2': lambda2, 'kelly': kelly}
     ai_text = await generate_ai_explanation(match['team1'], match['team2'], rec, confidence, stats_for_ai)
     
-    mc = result.get('mc') or {}
-    top_score = mc.get('top_score', '1:1')
-    
     drop_text = ""
     if bookmaker_odds.get('is_dropping') and bookmaker_odds.get('old_odds', 0) > 0:
         drop_text = f"\n🔥 <b>Дроп линии:</b> кэф упал с {bookmaker_odds['old_odds']} до {odds_val} (умные деньги грузят!)\n"
+    
+    # Формируем текст рынков Монте-Карло или Киберспорта
+    mc_text = ""
+    if sport == 'esports':
+        # Расчет котировок по картам
+        elo_diff = t1['elo_rating'] - t2['elo_rating']
+        p1_map_prob = 1 / (1 + 10 ** (-elo_diff / 400)) * 100
+        match_format = match.get('format', 3)
+        map_markets = EsportsMapModel.calculate_maps(p1_map_prob, match_format)
+        
+        mc_text = "🎮 <b>Рынки по картам:</b>\n"
+        if match_format == 3:
+            mc_text += (f"• Тотал карт больше 2.5: {map_markets.get('tb_2_5', 0)}%\n"
+                        f"• Фора 1 (-1.5): {map_markets.get('f1_minus_1_5', 0)}% | Фора 2 (+1.5): {map_markets.get('f2_plus_1_5', 0)}%\n"
+                        f"• Фора 1 (+1.5): {map_markets.get('f1_plus_1_5', 0)}% | Фора 2 (-1.5): {map_markets.get('f2_minus_1_5', 0)}%\n\n")
+        elif match_format == 5:
+            mc_text += (f"• Тотал карт больше 3.5: {map_markets.get('tb_3_5', 0)}%\n"
+                        f"• Фора 1 (-1.5): {map_markets.get('f1_minus_1_5', 0)}% | Фора 2 (+1.5): {map_markets.get('f2_plus_1_5', 0)}%\n\n")
+        else:
+            mc_text += "• Формат: Bo1 (Рынки по картам недоступны)\n\n"
+    else:
+        mc = result.get('mc') or {}
+        top_score = mc.get('top_score', '1:1')
+        mc_text = (
+            f"🎲 <b>Доп. рынки (Monte Carlo):</b>\n"
+            f"• Точный счет: <b>{top_score}</b> ({mc.get('top_score_prob', 0)}%)\n"
+            f"• Обе забьют (ОЗ-Да): {mc.get('btts_prob', 0)}%\n"
+            f"• Тотал больше 2.5: {mc.get('over_2_5_prob', 0)}%\n"
+            f"• Двойной шанс (1X): {mc.get('dc_1x', 0)}% | (12): {mc.get('dc_12', 0)}%\n"
+            f"• Фора 1 (-1.5): {mc.get('ah1_-1.5', 0)}% | Фора 2 (+1): {mc.get('ah2_+1', 0)}%\n\n"
+        )
     
     analysis = (
         f"🏆 <b>{match.get('tournament', '')}</b>\n"
         f"📊 П1={result['p1']}% | X={result.get('x',0)}% | П2={result['p2']}%\n"
         f"📈 Кэф: {odds_val} | Kelly: {kelly}%\n"
         f"{drop_text}\n"
-        f"🎲 <b>Доп. рынки (Monte Carlo):</b>\n"
-        f"• Точный счет: <b>{top_score}</b> ({mc.get('top_score_prob', 0)}%)\n"
-        f"• Обе забьют (ОЗ-Да): {mc.get('btts_prob', 0)}%\n"
-        f"• Тотал больше 2.5: {mc.get('over_2_5_prob', 0)}%\n"
-        f"• Двойной шанс (1X): {mc.get('dc_1x', 0)}% | (12): {mc.get('dc_12', 0)}%\n"
-        f"• Фора 1 (-1.5): {mc.get('ah1_-1.5', 0)}% | Фора 2 (+1): {mc.get('ah2_+1', 0)}%\n\n"
+        f"{mc_text}"
         f"{ai_text}\n"
     )
     
-    return {'analysis': analysis, 'probabilities': {'p1': result['p1'], 'x': result.get('x', 0), 'p2': result['p2'], 'method': result['method'], 'components': result.get('components'), 'odds': odds_val, 'kelly': kelly, 'rec': rec, 'top_score': top_score, 'btts': mc.get('btts_prob', 0)}, 'recommendation': rec, 'confidence': confidence, 'bet_type': 'Исход'}
+    return {'analysis': analysis, 'probabilities': {'p1': result['p1'], 'x': result.get('x', 0), 'p2': result['p2'], 'method': result['method'], 'components': result.get('components'), 'odds': odds_val, 'kelly': kelly, 'rec': rec, 'top_score': top_score if sport != 'esports' else 'N/A', 'btts': mc.get('btts_prob', 0) if sport != 'esports' else 0}, 'recommendation': rec, 'confidence': confidence, 'bet_type': 'Исход'}
 
 async def collect_and_analyze_job():
     db = await get_db()
@@ -1032,7 +1079,7 @@ async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
     await init_db()
     
-    # ИСПРАВЛЕНИЕ: Backfill запускается в фоне, чтобы не блокировать Polling
+    # Backfill запускается в фоне, чтобы не блокировать Polling
     logger.info("📚 Запускаю подгрузку истории матчей в фоне...")
     asyncio.create_task(backfill_football_history())
     
