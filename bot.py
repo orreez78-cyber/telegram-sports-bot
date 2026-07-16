@@ -480,29 +480,42 @@ async def fetch_pandascore_matches():
     _matches_cache.set("matches_esports", matches)
     return matches
 
-async def fetch_thesportsdb_hockey_matches():
-    # Берем переменную напрямую из окружения (переименована в HOCKEY_API_SPORTS)
-    league_id = os.getenv("HOCKEY_API_SPORTS", "")
-    if not league_id: return []
+async def fetch_api_sport_hockey_matches():
+    """Сбор хоккейных матчей напрямую из API-Sport (Hockey)"""
+    hockey_api_key = os.getenv("HOCKEY_API_SPORTS", "")
+    if not hockey_api_key: return []
     
-    thesportsdb_key = os.getenv("THESPORTSDB_KEY", "123")
+    url = "https://v1.hockey.api-sports.io/games"
+    headers = {"x-apisports-key": hockey_api_key}
+    params = {"date": datetime.now().strftime("%Y-%m-%d")}
     
-    data = await fetch_json_with_retry(f"https://app.api-sport.ru/dashboard/6834e018-33cd-44c2-8195-a442fe73063d/eventsnextleague.php", params={"id": league_id})
+    data = await fetch_json_with_retry(url, headers=headers, params=params)
     matches = []
-    if data and data.get('events'):
-        for ev in data['events']:
-            if ev.get('strHomeTeam') and ev.get('strAwayTeam'):
-                matches.append({"id": f"th_{ev['idEvent']}", "team1": ev['strHomeTeam'], "team2": ev['strAwayTeam'], "date": ev.get('strTimestamp') or ev.get('dateEvent', ''), "sport": "hockey", "tournament": ev.get('strLeague', 'Хоккей')})
+    if data and data.get('response'):
+        for g in data['response']:
+            matches.append({
+                "id": f"hk_{g['game']['id']}",
+                "team1": g['teams']['home']['name'],
+                "team2": g['teams']['away']['name'],
+                "date": g['game']['date']['start'] if 'date' in g['game'] else g['game'].get('date', ''),
+                "sport": "hockey",
+                "tournament": g['league']['name']
+            })
     return matches
 
 async def fetch_hockey_matches():
-    cached = _matches_cache.get("matches_hockey")
+    cache_key = "matches_hockey"
+    cached = _matches_cache.get(cache_key)
     if cached: return cached
-    real_matches = await fetch_thesportsdb_hockey_matches()
+    
+    real_matches = await fetch_api_sport_hockey_matches()
     if real_matches:
-        _matches_cache.set("matches_hockey", real_matches)
+        _matches_cache.set(cache_key, real_matches)
         return real_matches
-    return [{"id": "hk_301", "team1": "ЦСКА", "team2": "СКА", "date": datetime.now().strftime("%Y-%m-%d"), "sport": "hockey", "tournament": "КХЛ", "is_mock_source": True}]
+        
+    # Фолбэк на мок, если ключ не указан или API недоступно
+    today = datetime.now().strftime("%Y-%m-%d")
+    return [{"id": "hk_301", "team1": "ЦСКА", "team2": "СКА", "date": today, "sport": "hockey", "tournament": "КХЛ", "is_mock_source": True}]
 
 async def fetch_live_football_matches():
     if not FOOTBALL_API_KEY: return []
