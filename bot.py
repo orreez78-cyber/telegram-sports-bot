@@ -728,7 +728,7 @@ async def analyze_match(match):
     lambda2 = round(((t2['goals_scored_away'] + t1['goals_conceded_home']) / 2) * 0.95, 2)
     
     t1_data = {'goals_avg': lambda1, 'strength': t1['strength'] + round((t1_home_factor - 1.0) * 50, 0), 'form': t1['form'], 'elo_rating': t1['elo_rating']}
-    t2_data = {'goals_avg': lambda2, 'strength': t2['strength'], 'form': t2['form', 'elo_rating': t2['elo_rating']}
+    t2_data = {'goals_avg': lambda2, 'strength': t2['strength'], 'form': t2['form'], 'elo_rating': t2['elo_rating']}
     
     bookmaker_odds = await fetch_bookmaker_odds(match['team1'], match['team2'], sport)
     weights = await get_current_weights()
