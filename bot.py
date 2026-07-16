@@ -476,7 +476,18 @@ async def fetch_api_football_matches():
     matches = []
     if data:
         for f in data.get('response', []):
-            matches.append({"id": f"af_{f['fixture']['id']}", "team1": f['teams']['home']['name'], "team2": f['teams']['away']['name'], "date": f['fixture']['date'], "sport": "football", "tournament": f['league']['name']})
+            try:
+                team1 = f.get('teams', {}).get('home', {}).get('name')
+                team2 = f.get('teams', {}).get('away', {}).get('name')
+                if not team1 or not team2: continue # Пропускаем, если команда неизвестна (TBD)
+                matches.append({
+                    "id": f"af_{f['fixture']['id']}", 
+                    "team1": team1, "team2": team2, 
+                    "date": f['fixture']['date'], "sport": "football", 
+                    "tournament": f.get('league', {}).get('name', 'Unknown')
+                })
+            except Exception:
+                continue
     return matches
 
 async def fetch_football_matches():
@@ -507,7 +518,7 @@ async def fetch_pandascore_matches():
 
 async def fetch_api_sport_hockey_matches():
     """Сбор хоккейных матчей напрямую из API-Sport (Hockey)"""
-    hockey_api_key = os.getenv("HOCKEY_API_SPORTS", "6834e018-33cd-44c2-8195-a442fe73063d")
+    hockey_api_key = os.getenv("HOCKEY_API_SPORTS", "")
     if not hockey_api_key: 
         logger.warning("HOCKEY_API_SPORTS не задан в окружении. Использую мок-данные.")
         return []
@@ -520,14 +531,27 @@ async def fetch_api_sport_hockey_matches():
     matches = []
     if data and data.get('response'):
         for g in data['response']:
-            matches.append({
-                "id": f"hk_{g['game']['id']}",
-                "team1": g['teams']['home']['name'],
-                "team2": g['teams']['away']['name'],
-                "date": g['game']['date']['start'] if 'date' in g['game'] else g['game'].get('date', ''),
-                "sport": "hockey",
-                "tournament": g['league']['name']
-            })
+            try:
+                team1 = g.get('teams', {}).get('home', {}).get('name')
+                team2 = g.get('teams', {}).get('away', {}).get('name')
+                if not team1 or not team2: continue
+                
+                game_date = g.get('game', {}).get('date')
+                if isinstance(game_date, dict):
+                    game_date = game_date.get('start', '')
+                elif not game_date:
+                    game_date = ''
+                
+                matches.append({
+                    "id": f"hk_{g['game']['id']}",
+                    "team1": team1,
+                    "team2": team2,
+                    "date": game_date,
+                    "sport": "hockey",
+                    "tournament": g.get('league', {}).get('name', 'Hockey')
+                })
+            except Exception:
+                continue
     elif data and data.get('errors'):
         logger.error(f"Ошибка API-Sport Hockey: {data.get('errors')}")
     return matches
@@ -550,8 +574,20 @@ async def fetch_live_football_matches():
     live_matches = []
     if data:
         for f in data.get('response', []):
-            if f['league']['id'] in POPULAR_LIVE_LEAGUES:
-                live_matches.append({"id": f"af_{f['fixture']['id']}", "team1": f['teams']['home']['name'], "team2": f['teams']['away']['name'], "score1": f['goals']['home'] or 0, "score2": f['goals']['away'] or 0, "minute": f['fixture']['status']['elapsed'] or 0, "tournament": f['league']['name'], "sport": "football"})
+            if f.get('league', {}).get('id') in POPULAR_LIVE_LEAGUES:
+                try:
+                    team1 = f.get('teams', {}).get('home', {}).get('name')
+                    team2 = f.get('teams', {}).get('away', {}).get('name')
+                    if not team1 or not team2: continue
+                    live_matches.append({
+                        "id": f"af_{f['fixture']['id']}", "team1": team1, "team2": team2, 
+                        "score1": f.get('goals', {}).get('home') or 0, 
+                        "score2": f.get('goals', {}).get('away') or 0, 
+                        "minute": f.get('fixture', {}).get('status', {}).get('elapsed') or 0, 
+                        "tournament": f.get('league', {}).get('name', 'Unknown'), "sport": "football"
+                    })
+                except Exception:
+                    continue
     limit = int(os.getenv("MAX_LIVE_FOOTBALL", 2))
     live_matches = live_matches[:limit]
     _live_cache.set("live_football", live_matches)
