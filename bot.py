@@ -481,8 +481,13 @@ async def fetch_pandascore_matches():
     return matches
 
 async def fetch_thesportsdb_hockey_matches():
-    if not HOCKEY_LEAGUE_ID_THESPORTSDB: return []
-    data = await fetch_json_with_retry(f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_KEY}/eventsnextleague.php", params={"id": HOCKEY_LEAGUE_ID_THESPORTSDB})
+    # Берем переменную напрямую из окружения (переименована в HOCKEY_API_SPORTS)
+    league_id = os.getenv("HOCKEY_API_SPORTS", "")
+    if not league_id: return []
+    
+    thesportsdb_key = os.getenv("THESPORTSDB_KEY", "123")
+    
+    data = await fetch_json_with_retry(f"https://app.api-sport.ru/dashboard/6834e018-33cd-44c2-8195-a442fe73063d/eventsnextleague.php", params={"id": league_id})
     matches = []
     if data and data.get('events'):
         for ev in data['events']:
