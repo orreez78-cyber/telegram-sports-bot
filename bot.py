@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import json
 import logging
 import math
@@ -27,9 +28,26 @@ VALUE_BET_KELLY_FRACTION = 0.25  # quarter-Kelly staking for safety
 VALUE_BET_KELLY_CAP = 0.05     # never stake more than 5% of bankroll on one bet
 VALUE_BET_MATURITY_GAMES = 20  # games of history before full stake confidence
 
+# The Odds API sport keys queried for odds. A fixture's league isn't always
+# known, so we scan these until the two teams are found. Each key is one API
+# request against your quota - keep the list tight.
+# TODO(you): add/remove leagues you care about. Full list of keys:
+# https://the-odds-api.com/sports-odds-data/sports-apis.html
+ODDS_SOCCER_KEYS = [
+    "soccer_epl", "soccer_germany_bundesliga", "soccer_germany_bundesliga2",
+    "soccer_spain_la_liga", "soccer_italy_serie_a", "soccer_france_ligue_one",
+    "soccer_uefa_champs_league",
+]
+ODDS_HOCKEY_KEYS = ["icehockey_nhl"]
+# Minimum fuzzy name similarity to accept an odds event as the same fixture.
+ODDS_MATCH_THRESHOLD = 0.6
+
 # ==================== НАСТРОЙКИ ====================
 # Secrets come from the environment only (see .env.example). No fallback
 # defaults: committing live keys leaks them and makes rotation impossible.
+# TODO(you): put real values in .env (copy .env.example). Only TELEGRAM_TOKEN
+# is required; the rest each enable an optional data source. Rotate any key
+# that was ever committed to git history.
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")
@@ -84,6 +102,9 @@ POPULAR_LIVE_LEAGUES = [39, 140, 135, 78, 61, 2, 3]
 # api.openligadb.de. The previous host/shortcuts silently returned no data, so
 # no historical training ever happened.
 OPENLIGADB_BASE = "https://api.openligadb.de"
+# TODO(you): OpenLigaDB is free but German-only. Add more (league_shortcut,
+# name) pairs here to train Elo/goal ratings on more matches. Browse shortcuts
+# at https://api.openligadb.de/getavailableleagues
 OPENLIGADB_LEAGUES = [
     ("bl1", "Бундеслига"), ("bl2", "2. Бундеслига"), ("bl3", "3. Лига"),
 ]
@@ -151,8 +172,58 @@ def _normalize_date(dt_str: str) -> str:
     if not dt_str: return ""
     return dt_str.replace("T", " ").replace("Z", "")[:19]
 
+# Only generic club boilerplate. NOT "city"/"united" etc. - those distinguish
+# clubs (e.g. Manchester City vs Manchester United).
+_TEAM_STOPWORDS = {"fc", "cf", "sc", "afc", "fk", "bk", "club", "the", "calcio"}
+
 def _normalize_name(name: str) -> str:
     return "".join(ch.lower() for ch in name if ch.isalnum())
+
+def _name_tokens(name: str) -> set:
+    """Significant lowercase word tokens of a team name (stopwords removed)."""
+    words = "".join(ch.lower() if ch.isalnum() else " " for ch in name).split()
+    tokens = {w for w in words if w not in _TEAM_STOPWORDS and len(w) > 2}
+    return tokens or set(words)
+
+def _token_sim(x: str, y: str) -> float:
+    """Similarity of two individual word tokens, with prefix/substring credit.
+
+    "man" -> "manchester" scores 1.0 (abbreviation), while "münchen" ->
+    "munich" scores on character ratio (~0.7). "city" -> "united" stays low.
+    """
+    if x == y or (len(x) >= 3 and (x in y or y in x)):
+        return 1.0
+    return difflib.SequenceMatcher(None, x, y).ratio()
+
+def team_name_similarity(a: str, b: str) -> float:
+    """Fuzzy 0..1 similarity between two team names from different providers.
+
+    Every significant token of the shorter name must find a good match in the
+    longer one (we take the *minimum* of per-token best matches), so shared
+    boilerplate like "Manchester" can't make "Manchester City" look like
+    "Manchester United" - the distinguishing token (city vs united) fails.
+    Handles "FC Bayern München" == "Bayern Munich", "Man City" ==
+    "Manchester City".
+    """
+    na, nb = _normalize_name(a), _normalize_name(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb or na in nb or nb in na:
+        return 1.0
+    ta, tb = _name_tokens(a), _name_tokens(b)
+    if not ta or not tb:
+        return difflib.SequenceMatcher(None, na, nb).ratio()
+    small, large = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    return min(max(_token_sim(x, y) for y in large) for x in small)
+
+def teams_match(home: str, away: str, t1: str, t2: str, threshold: float = 0.6) -> bool:
+    """True if an event's (home, away) refers to the same fixture as (t1, t2).
+
+    Order-insensitive; both teams must clear ``threshold`` similarity.
+    """
+    direct = min(team_name_similarity(home, t1), team_name_similarity(away, t2))
+    swapped = min(team_name_similarity(home, t2), team_name_similarity(away, t1))
+    return max(direct, swapped) >= threshold
 
 async def fetch_json_with_retry(url, headers=None, params=None, max_retries=3):
     session = await get_session()
@@ -441,21 +512,37 @@ def strength_from_elo(elo: float, default_elo: float = DEFAULT_ELO) -> float:
     """
     return max(1.0, min(99.0, 50 + (elo - default_elo) / ELO_STRENGTH_DIVISOR))
 
+def expected_goals(attack: float, opponent_defense: float,
+                   league_avg: float = POISSON_LEAGUE_AVG, multiplier: float = 1.0) -> float:
+    """Expected goals = own attack strength x opponent defensive weakness.
+
+    Standard Poisson football model: a team scores more against a leaky
+    defense. `attack` is the team's goals-scored rate, `opponent_defense` is
+    how many the opponent typically concedes; both are normalized by the
+    league average so the product stays on a goals scale.
+    """
+    if league_avg <= 0:
+        return attack * multiplier
+    return (attack * opponent_defense / league_avg) * multiplier
+
 def build_match_features(t1: dict, t2: dict, home_advantage: float = HOME_ADVANTAGE):
     """Turn two stored team-rating rows into EnsemblePredictor input dicts.
 
-    Feeds the *trained* signals (goals_avg + Elo-derived strength + form) into
-    the model and applies home advantage to the home side. Shared by the live
+    Feeds the *trained* signals into the model: expected goals from attack vs.
+    opponent defense (goals scored & conceded EMAs), Elo-derived strength, and
+    form. Home advantage is applied to the home side. Shared by the live
     analyzer and the backtester so both score matches identically.
     """
+    t1_def = t1.get('goals_conceded', DEFAULT_GOALS_AVG)
+    t2_def = t2.get('goals_conceded', DEFAULT_GOALS_AVG)
     t1_features = {
-        'goals_avg': t1['goals_avg'] * home_advantage,
+        'goals_avg': expected_goals(t1['goals_avg'], t2_def, multiplier=home_advantage),
         'strength': strength_from_elo(t1['elo_rating']),
         'form': t1['form'],
         'elo_rating': t1['elo_rating'],
     }
     t2_features = {
-        'goals_avg': t2['goals_avg'],
+        'goals_avg': expected_goals(t2['goals_avg'], t1_def),
         'strength': strength_from_elo(t2['elo_rating']),
         'form': t2['form'],
         'elo_rating': t2['elo_rating'],
@@ -541,8 +628,10 @@ async def get_team_data(team_name: str, sport: str) -> dict:
     async with db.execute("SELECT elo, strength, goals_avg, form, games_played, goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away FROM team_ratings WHERE team_id = ?", (key,)) as cursor:
         row = await cursor.fetchone()
     if row:
-        return {'elo_rating': row[0], 'strength': row[1], 'goals_avg': row[2], 'form': row[3] if row[3] is not None else DEFAULT_FORM, 'games_played': row[4] or 0, 'goals_scored_home': row[5] if row[5] is not None else DEFAULT_GOALS_AVG, 'goals_scored_away': row[6] if row[6] is not None else DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_home': row[7] if row[7] is not None else DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_away': row[8] if row[8] is not None else DEFAULT_GOALS_AVG}
-    return {'elo_rating': DEFAULT_ELO, 'strength': DEFAULT_STRENGTH, 'goals_avg': DEFAULT_GOALS_AVG, 'form': DEFAULT_FORM, 'games_played': 0, 'goals_scored_home': DEFAULT_GOALS_AVG, 'goals_scored_away': DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_home': DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_away': DEFAULT_GOALS_AVG}
+        # goals_conceded_home is repurposed as the overall goals-conceded EMA
+        # (defensive strength); exposed as 'goals_conceded'.
+        return {'elo_rating': row[0], 'strength': row[1], 'goals_avg': row[2], 'form': row[3] if row[3] is not None else DEFAULT_FORM, 'games_played': row[4] or 0, 'goals_scored_home': row[5] if row[5] is not None else DEFAULT_GOALS_AVG, 'goals_scored_away': row[6] if row[6] is not None else DEFAULT_GOALS_AVG * 0.8, 'goals_conceded': row[7] if row[7] is not None else DEFAULT_GOALS_AVG, 'goals_conceded_home': row[7] if row[7] is not None else DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_away': row[8] if row[8] is not None else DEFAULT_GOALS_AVG}
+    return {'elo_rating': DEFAULT_ELO, 'strength': DEFAULT_STRENGTH, 'goals_avg': DEFAULT_GOALS_AVG, 'form': DEFAULT_FORM, 'games_played': 0, 'goals_scored_home': DEFAULT_GOALS_AVG, 'goals_scored_away': DEFAULT_GOALS_AVG * 0.8, 'goals_conceded': DEFAULT_GOALS_AVG, 'goals_conceded_home': DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_away': DEFAULT_GOALS_AVG}
 
 async def garbage_collector_job():
     db = await get_db()
@@ -552,47 +641,75 @@ async def garbage_collector_job():
 
 # ==================== СБОР ДАННЫХ И КОЭФФИЦИЕНТОВ (BEST ODDS + DROPPING) ====================
 
+def _best_prices_from_event(event: dict) -> dict:
+    """Best (highest) available price per outcome across all bookmakers.
+
+    Taking the best line across books shrinks the effective margin - a key
+    part of finding value. Outcome names are fuzzy-matched to the event's
+    home/away teams so provider naming differences don't drop prices.
+    """
+    home_team, away_team = event.get('home_team', ''), event.get('away_team', '')
+    best_home = best_away = best_draw = 0
+    for bk in event.get('bookmakers', []):
+        for market in bk.get('markets', []):
+            for outcome in market.get('outcomes', []):
+                price = outcome.get('price', 0)
+                if price <= 0:
+                    continue
+                name = outcome.get('name', '')
+                if name == 'Draw':
+                    best_draw = max(best_draw, price)
+                elif team_name_similarity(name, home_team) >= team_name_similarity(name, away_team):
+                    best_home = max(best_home, price)
+                else:
+                    best_away = max(best_away, price)
+    return {'home': best_home, 'draw': best_draw, 'away': best_away}
+
 async def fetch_bookmaker_odds(team1: str, team2: str, sport: str):
     fallback = {'home': 2.0, 'draw': 3.5, 'away': 3.0, 'bookmaker': 'Mock', 'is_mock': True, 'is_dropping': False, 'old_odds': 0}
     if not THE_ODDS_API_KEY: return fallback
-    sport_key = 'soccer_epl' if sport == 'football' else ('icehockey_nhl' if sport == 'hockey' else None)
-    if not sport_key: return fallback
+    if sport == 'football':
+        sport_keys = ODDS_SOCCER_KEYS
+    elif sport == 'hockey':
+        sport_keys = ODDS_HOCKEY_KEYS
+    else:
+        return fallback
 
     cache_key = f"odds_{team1}_{team2}"
     cached_odds = _odds_cache.get(cache_key)
 
-    t1_norm, t2_norm = _normalize_name(team1), _normalize_name(team2)
-    data = await fetch_json_with_retry(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds", params={'apiKey': THE_ODDS_API_KEY, 'regions': 'eu', 'markets': 'h2h', 'dateFormat': 'iso'})
-    
-    if data:
+    # Scan configured leagues; stop at the first event matching both teams.
+    for sport_key in sport_keys:
+        data = await fetch_json_with_retry(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds", params={'apiKey': THE_ODDS_API_KEY, 'regions': 'eu', 'markets': 'h2h', 'dateFormat': 'iso'})
+        if not data:
+            continue
         for event in data:
             home_team, away_team = event.get('home_team', ''), event.get('away_team', '')
-            if (_normalize_name(home_team) == t1_norm and _normalize_name(away_team) == t2_norm) or (_normalize_name(home_team) == t2_norm and _normalize_name(away_team) == t1_norm):
-                best_home, best_away, best_draw = 0, 0, 0
-                for bk in event.get('bookmakers', []):
-                    for market in bk.get('markets', []):
-                        for outcome in market.get('outcomes', []):
-                            price = outcome.get('price', 0)
-                            if price > 0:
-                                if outcome.get('name') == home_team: best_home = max(best_home, price)
-                                elif outcome.get('name') == away_team: best_away = max(best_away, price)
-                                elif outcome.get('name') == 'Draw': best_draw = max(best_draw, price)
-                
-                if best_home > 0 or best_away > 0:
-                    is_dropping = False
-                    old_odds = 0
-                    if cached_odds and not cached_odds.get('is_mock') and best_home > 0:
-                        old_odds = cached_odds.get('home', 0)
-                        if old_odds > 0 and (old_odds - best_home) / old_odds >= 0.10:
-                            is_dropping = True
-                    
-                    new_odds = {'home': best_home, 'draw': best_draw, 'away': best_away, 'bookmaker': "Best Market", 'is_mock': False, 'is_dropping': is_dropping, 'old_odds': old_odds}
-                    _odds_cache.set(cache_key, new_odds)
-                    return new_odds
+            if not teams_match(home_team, away_team, team1, team2, ODDS_MATCH_THRESHOLD):
+                continue
+            prices = _best_prices_from_event(event)
+            # If the event is listed away-team-first vs our (team1, team2), swap.
+            if team_name_similarity(home_team, team2) > team_name_similarity(home_team, team1):
+                prices['home'], prices['away'] = prices['away'], prices['home']
+            if prices['home'] <= 0 and prices['away'] <= 0:
+                continue
+
+            is_dropping, old_odds = False, 0
+            if cached_odds and not cached_odds.get('is_mock') and prices['home'] > 0:
+                old_odds = cached_odds.get('home', 0)
+                if old_odds > 0 and (old_odds - prices['home']) / old_odds >= 0.10:
+                    is_dropping = True
+
+            new_odds = {**prices, 'bookmaker': "Best Market", 'is_mock': False, 'is_dropping': is_dropping, 'old_odds': old_odds}
+            _odds_cache.set(cache_key, new_odds)
+            return new_odds
     return fallback
 
 async def fetch_api_football_matches():
     if not FOOTBALL_API_KEY: return []
+    # TODO(you): this pulls ALL of today's fixtures. To focus on specific
+    # competitions (and save quota), add "league" and "season" to params, e.g.
+    # params={"date": ..., "league": 39, "season": 2024}  # 39 = Premier League
     data = await fetch_json_with_retry("https://v3.football.api-sports.io/fixtures", headers={"x-apisports-key": FOOTBALL_API_KEY}, params={"date": datetime.now().strftime("%Y-%m-%d")})
     matches = []
     if data:
@@ -769,13 +886,16 @@ async def update_team_ratings_from_result(sport: str, team1: str, team2: str, sc
     new_elo2 = updated_elo(t2['elo_rating'], 1 - actual1, 1 - expected1)
     new_goals1 = updated_goals_avg(t1['goals_avg'], score1)
     new_goals2 = updated_goals_avg(t2['goals_avg'], score2)
+    # Defensive EMA: each team "concedes" the opponent's score.
+    new_conceded1 = updated_goals_avg(t1['goals_conceded'], score2)
+    new_conceded2 = updated_goals_avg(t2['goals_conceded'], score1)
     new_form1 = updated_form(t1['form'], actual1)
     new_form2 = updated_form(t2['form'], 1 - actual1)
 
-    await db.execute("INSERT INTO team_ratings (team_id, sport, elo, strength, goals_avg, form, games_played, goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(team_id) DO UPDATE SET elo=excluded.elo, goals_avg=excluded.goals_avg, form=excluded.form, games_played=excluded.games_played, updated_at=excluded.updated_at", 
-                     (f"{sport}_{team1}", sport, new_elo1, t1['strength'], new_goals1, new_form1, t1['games_played']+1, t1['goals_scored_home'], t1['goals_scored_away'], t1['goals_conceded_home'], t1['goals_conceded_away']))
-    await db.execute("INSERT INTO team_ratings (team_id, sport, elo, strength, goals_avg, form, games_played, goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(team_id) DO UPDATE SET elo=excluded.elo, goals_avg=excluded.goals_avg, form=excluded.form, games_played=excluded.games_played, updated_at=excluded.updated_at", 
-                     (f"{sport}_{team2}", sport, new_elo2, t2['strength'], new_goals2, new_form2, t2['games_played']+1, t2['goals_scored_home'], t2['goals_scored_away'], t2['goals_conceded_home'], t2['goals_conceded_away']))
+    await db.execute("INSERT INTO team_ratings (team_id, sport, elo, strength, goals_avg, form, games_played, goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(team_id) DO UPDATE SET elo=excluded.elo, goals_avg=excluded.goals_avg, form=excluded.form, games_played=excluded.games_played, goals_conceded_home=excluded.goals_conceded_home, updated_at=excluded.updated_at", 
+                     (f"{sport}_{team1}", sport, new_elo1, t1['strength'], new_goals1, new_form1, t1['games_played']+1, t1['goals_scored_home'], t1['goals_scored_away'], new_conceded1, t1['goals_conceded_away']))
+    await db.execute("INSERT INTO team_ratings (team_id, sport, elo, strength, goals_avg, form, games_played, goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(team_id) DO UPDATE SET elo=excluded.elo, goals_avg=excluded.goals_avg, form=excluded.form, games_played=excluded.games_played, goals_conceded_home=excluded.goals_conceded_home, updated_at=excluded.updated_at", 
+                     (f"{sport}_{team2}", sport, new_elo2, t2['strength'], new_goals2, new_form2, t2['games_played']+1, t2['goals_scored_home'], t2['goals_scored_away'], new_conceded2, t2['goals_conceded_away']))
     await db.commit()
 
 async def record_component_scores(match_id: str, components: dict, actual_result: str):

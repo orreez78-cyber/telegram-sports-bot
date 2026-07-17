@@ -28,6 +28,7 @@ def default_team_state() -> dict:
     return {
         "elo_rating": bot.DEFAULT_ELO,
         "goals_avg": bot.DEFAULT_GOALS_AVG,
+        "goals_conceded": bot.DEFAULT_GOALS_AVG,
         "form": bot.DEFAULT_FORM,
         "games_played": 0,
     }
@@ -50,6 +51,8 @@ class TeamRatings:
         t2["elo_rating"] = bot.updated_elo(t2["elo_rating"], 1 - actual1, 1 - expected1)
         t1["goals_avg"] = bot.updated_goals_avg(t1["goals_avg"], home_goals)
         t2["goals_avg"] = bot.updated_goals_avg(t2["goals_avg"], away_goals)
+        t1["goals_conceded"] = bot.updated_goals_avg(t1["goals_conceded"], away_goals)
+        t2["goals_conceded"] = bot.updated_goals_avg(t2["goals_conceded"], home_goals)
         t1["form"] = bot.updated_form(t1["form"], actual1)
         t2["form"] = bot.updated_form(t2["form"], 1 - actual1)
         t1["games_played"] += 1
@@ -118,6 +121,59 @@ def run_backtest(matches: Iterable[dict], warmup_games: int = 5,
     }
 
 
+def run_value_bet_backtest(matches: Iterable[dict], warmup_games: int = 5,
+                           min_ev: float = bot.VALUE_BET_MIN_EV,
+                           kelly_fraction: float = bot.VALUE_BET_KELLY_FRACTION,
+                           kelly_cap: float = bot.VALUE_BET_KELLY_CAP,
+                           home_advantage: float = bot.HOME_ADVANTAGE) -> dict:
+    """Walk-forward value-betting simulation. Requires odds on each match.
+
+    Each match dict must additionally carry ``odds`` = {home, draw, away}
+    (decimal). For every warmed-up match the model prices the game, and if a
+    positive-EV selection clears ``min_ev`` a fractional-Kelly stake is placed
+    on a 1-unit bankroll basis and settled against the real result. Reports
+    ROI, hit rate, average EV and worst drawdown - the only honest read on
+    whether the model beats the offered prices.
+    """
+    matches = list(matches)
+    ratings = TeamRatings()
+    settled: list[tuple[float, float, bool]] = []  # (stake, odds, won)
+    evs: list[float] = []
+    bankroll, peak, max_drawdown = 1.0, 1.0, 0.0
+
+    for m in matches:
+        home, away = m["team1"], m["team2"]
+        hg, ag = m["home_goals"], m["away_goals"]
+        t1, t2 = ratings.get(home), ratings.get(away)
+        warm = t1["games_played"] >= warmup_games and t2["games_played"] >= warmup_games
+        odds = m.get("odds")
+
+        if warm and odds:
+            probs = predict_probs(ratings, home, away, home_advantage=home_advantage)
+            pct = tuple(p * 100 for p in probs)
+            vb = evaluation.select_value_bet(pct, odds, min_ev=min_ev,
+                                             kelly_multiplier=kelly_fraction, kelly_cap=kelly_cap)
+            if vb:
+                actual = evaluation.outcome_from_score(hg, ag)
+                won = vb["outcome"] == actual
+                stake = vb["stake_fraction"] * bankroll
+                settled.append((stake, vb["odds"], won))
+                evs.append(vb["ev"])
+                bankroll += stake * (vb["odds"] - 1) if won else -stake
+                peak = max(peak, bankroll)
+                max_drawdown = max(max_drawdown, (peak - bankroll) / peak)
+
+        ratings.update(home, away, hg, ag)
+
+    summary = evaluation.roi_summary(settled)
+    summary.update({
+        "final_bankroll": round(bankroll, 4),
+        "max_drawdown": round(max_drawdown, 4),
+        "avg_ev": round(sum(evs) / len(evs), 4) if evs else 0.0,
+    })
+    return summary
+
+
 def _base_rate_reference(outcome_counts: dict, scored: int) -> dict:
     """Reference model that always predicts the dataset's outcome frequencies.
 
@@ -152,6 +208,43 @@ def fetch_openligadb(seasons: list[int]) -> list[dict]:
     return all_matches
 
 
+def attach_odds_from_file(matches: list[dict], path: str) -> int:
+    """Merge historical odds into matches from a JSON file.
+
+    The file is a list of {team1, team2, date?, odds:{home,draw,away}} records.
+    Matches are keyed by fuzzy team-name pairing so provider naming differences
+    don't lose records. Returns how many matches got odds attached.
+
+    TODO(you): to auto-pull historical odds instead of a file, use The Odds
+    API historical endpoint (paid plan required):
+    https://api.the-odds-api.com/v4/historical/sports/{sport}/odds?date=...&apiKey=...
+    Write the results to a JSON file in the shape above, or extend this loader.
+    """
+    with open(path) as fh:
+        records = json.load(fh)
+    attached = 0
+    for m in matches:
+        for rec in records:
+            if rec.get("odds") and bot.teams_match(rec.get("team1", ""), rec.get("team2", ""), m["team1"], m["team2"]):
+                m["odds"] = rec["odds"]
+                attached += 1
+                break
+    return attached
+
+
+def _print_value_report(roi: dict) -> None:
+    print("\n=== Value-betting simulation (needs odds) ===")
+    if roi["n"] == 0:
+        print("  no bets placed (no +EV opportunities, or no odds attached)")
+        return
+    print(f"bets placed        : {roi['n']}")
+    print(f"hit rate           : {roi['hit_rate']:.3f}")
+    print(f"avg model EV        : {roi['avg_ev']:+.3f}")
+    print(f"ROI                : {roi['roi']:+.3f}  (profit / staked)")
+    print(f"final bankroll     : {roi['final_bankroll']:.3f}  (started at 1.0)")
+    print(f"max drawdown       : {roi['max_drawdown']:.3f}")
+
+
 def _print_report(result: dict) -> None:
     print("\n=== Walk-forward backtest ===")
     print(f"teams tracked      : {result['teams_tracked']}")
@@ -171,6 +264,8 @@ def main() -> None:
                         help="Seasons (start year) to fetch and replay.")
     parser.add_argument("--warmup", type=int, default=5,
                         help="Minimum games per team before a match counts in the metrics.")
+    parser.add_argument("--odds-file", type=str, default=None,
+                        help="JSON file of historical odds to run the value-betting ROI simulation.")
     args = parser.parse_args()
 
     print(f"Fetching OpenLigaDB seasons {args.seasons} ...")
@@ -178,6 +273,15 @@ def main() -> None:
     print(f"Total finished matches: {len(matches)}")
     result = run_backtest(matches, warmup_games=args.warmup)
     _print_report(result)
+
+    if args.odds_file:
+        attached = attach_odds_from_file(matches, args.odds_file)
+        print(f"\nAttached odds to {attached} matches from {args.odds_file}")
+        roi = run_value_bet_backtest(matches, warmup_games=args.warmup)
+        _print_value_report(roi)
+    else:
+        print("\n(no --odds-file: skipping value-betting ROI. OpenLigaDB has no odds;")
+        print(" supply historical odds to measure real ROI. See attach_odds_from_file.)")
 
 
 if __name__ == "__main__":

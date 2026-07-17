@@ -80,9 +80,20 @@ def test_strength_from_elo_monotonic_and_clamped():
 
 
 def test_build_match_features_uses_home_advantage_and_elo():
-    t1 = {"goals_avg": 1.5, "form": 60, "elo_rating": 1600}
-    t2 = {"goals_avg": 1.5, "form": 40, "elo_rating": 1400}
+    la = bot.POISSON_LEAGUE_AVG
+    t1 = {"goals_avg": 1.5, "goals_conceded": 1.0, "form": 60, "elo_rating": 1600}
+    t2 = {"goals_avg": 1.5, "goals_conceded": 1.2, "form": 40, "elo_rating": 1400}
     f1, f2 = bot.build_match_features(t1, t2, home_advantage=1.2)
-    assert f1["goals_avg"] == pytest.approx(1.5 * 1.2)
-    assert f2["goals_avg"] == pytest.approx(1.5)
+    # expected goals = attack * opponent_defense / league_avg, home side * HA
+    assert f1["goals_avg"] == pytest.approx(1.5 * 1.2 / la * 1.2)
+    assert f2["goals_avg"] == pytest.approx(1.5 * 1.0 / la)
     assert f1["strength"] > f2["strength"]  # higher Elo -> higher strength
+
+
+def test_expected_goals_attack_vs_defense():
+    la = bot.POISSON_LEAGUE_AVG
+    # weaker opponent defense (concedes more) -> more expected goals
+    strong_def = bot.expected_goals(1.5, 0.8, league_avg=la)
+    weak_def = bot.expected_goals(1.5, 2.0, league_avg=la)
+    assert weak_def > strong_def
+    assert bot.expected_goals(1.5, la, league_avg=la) == pytest.approx(1.5)

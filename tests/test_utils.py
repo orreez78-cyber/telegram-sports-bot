@@ -1,7 +1,7 @@
 """Unit tests for caching and normalization utilities in bot.py."""
 import time
 
-from bot import TTLCache, _normalize_date, _normalize_name
+from bot import TTLCache, _normalize_date, _normalize_name, team_name_similarity, teams_match
 
 
 class TestTTLCache:
@@ -67,3 +67,26 @@ class TestNormalizeName:
 
     def test_matches_regardless_of_formatting(self):
         assert _normalize_name("FC Bayern") == _normalize_name("fcbayern")
+
+
+class TestTeamNameSimilarity:
+    def test_identical_and_boilerplate(self):
+        assert team_name_similarity("Arsenal", "Arsenal") == 1.0
+        assert team_name_similarity("FC Bayern München", "Bayern Munich") > 0.6
+        assert team_name_similarity("Man City", "Manchester City") > 0.6
+
+    def test_distinct_clubs_not_confused(self):
+        # City vs United must stay distinguishable
+        assert team_name_similarity("Manchester City", "Manchester United") < 0.6
+
+    def test_empty_names(self):
+        assert team_name_similarity("", "Arsenal") == 0.0
+
+
+class TestTeamsMatch:
+    def test_direct_and_swapped_order(self):
+        assert teams_match("Bayern Munich", "Dortmund", "FC Bayern München", "BVB Dortmund")
+        assert teams_match("Dortmund", "Bayern Munich", "FC Bayern München", "Borussia Dortmund")
+
+    def test_wrong_fixture_rejected(self):
+        assert not teams_match("Arsenal", "Chelsea", "Liverpool", "Everton")
