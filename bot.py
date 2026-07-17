@@ -102,6 +102,30 @@ async def get_db() -> aiosqlite.Connection:
         await _db_conn.execute("PRAGMA journal_mode=WAL")
     return _db_conn
 
+async def db_execute(query: str, params=(), *, commit: bool = False):
+    db = await get_db()
+    await db.execute(query, params)
+    if commit:
+        await db.commit()
+
+async def db_fetchone(query: str, params=()):
+    db = await get_db()
+    async with db.execute(query, params) as cursor:
+        return await cursor.fetchone()
+
+async def db_fetchall(query: str, params=()):
+    db = await get_db()
+    async with db.execute(query, params) as cursor:
+        return await cursor.fetchall()
+
+async def _cache_get_or_set(cache: "TTLCache", key: str, producer):
+    cached = cache.get(key)
+    if cached:
+        return cached
+    value = await producer()
+    cache.set(key, value)
+    return value
+
 def _normalize_date(dt_str: str) -> str:
     if not dt_str: return ""
     return dt_str.replace("T", " ").replace("Z", "")[:19]
@@ -123,6 +147,19 @@ async def fetch_json_with_retry(url, headers=None, params=None, max_retries=3):
             logger.error(f"Network Error {url}: {e}")
             await asyncio.sleep(1)
     return None
+
+def _apisports_headers(api_key: str) -> dict:
+    return {"x-apisports-key": api_key}
+
+def _pandascore_headers() -> dict:
+    return {"Authorization": f"Bearer {PANDASCORE_API_KEY}", "Accept": "application/json"}
+
+def _extract_team_names(container: dict):
+    teams = container.get('teams', {})
+    return teams.get('home', {}).get('name'), teams.get('away', {}).get('name')
+
+def _elo_expected(rating_a: float, rating_b: float) -> float:
+    return 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
 
 # ==================== ИИ-АГЕНТ (ИСПРАВЛЕНИЕ ПРОМПТА) ====================
 
@@ -278,8 +315,7 @@ def calculate_draw_prob(p1_prob):
 class EsportsModel:
     @staticmethod
     def predict(team1_data, team2_data):
-        elo_diff = team1_data['elo_rating'] - team2_data['elo_rating']
-        p1_elo = 1 / (1 + 10 ** (-elo_diff / 400)) * 100
+        p1_elo = _elo_expected(team1_data['elo_rating'], team2_data['elo_rating']) * 100
         p1_strength = 50 + (team1_data['strength'] - team2_data['strength']) * 0.5
         p1_form = 50 + (team1_data['form'] - team2_data['form']) * 0.3
         p1 = max(20, min(80, (p1_elo * 0.40 + p1_strength * 0.30 + p1_form * 0.20 + 2 * 0.10)))
@@ -372,9 +408,7 @@ async def add_user(user_id: int, username: str):
     await db.commit()
 
 async def get_balance(user_id: int) -> float:
-    db = await get_db()
-    async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
-        row = await cursor.fetchone()
+    row = await db_fetchone("SELECT balance FROM users WHERE user_id = ?", (user_id,))
     return row[0] if row else 0.0
 
 async def place_virtual_bet(user_id: int, match_id: str, bet_amount: float, odds: float, prediction: str):
@@ -384,9 +418,8 @@ async def place_virtual_bet(user_id: int, match_id: str, bet_amount: float, odds
     await db.commit()
 
 async def get_users_for_sport(sport: str):
-    db = await get_db()
-    async with db.execute(f"SELECT u.user_id FROM users u JOIN user_settings s ON u.user_id = s.user_id WHERE s.{sport} = 1") as cursor:
-        return [row[0] async for row in cursor]
+    rows = await db_fetchall(f"SELECT u.user_id FROM users u JOIN user_settings s ON u.user_id = s.user_id WHERE s.{sport} = 1")
+    return [row[0] for row in rows]
 
 async def save_prediction(match_id, sport, team1, team2, tournament, analysis, probs, rec, conf, bet_type, user_id=SYSTEM_USER_ID):
     db = await get_db()
@@ -400,25 +433,17 @@ async def save_prediction(match_id, sport, team1, team2, tournament, analysis, p
     await db.commit()
 
 async def get_today_predictions():
-    db = await get_db()
-    async with db.execute("SELECT match_id, sport, team1, team2, tournament, analysis, probabilities, recommendation, confidence, bet_type FROM predictions WHERE date(created_at) = date('now') AND confidence >= ? AND user_id = ? ORDER BY confidence DESC", (MIN_CONFIDENCE, SYSTEM_USER_ID)) as cursor:
-        return await cursor.fetchall()
+    return await db_fetchall("SELECT match_id, sport, team1, team2, tournament, analysis, probabilities, recommendation, confidence, bet_type FROM predictions WHERE date(created_at) = date('now') AND confidence >= ? AND user_id = ? ORDER BY confidence DESC", (MIN_CONFIDENCE, SYSTEM_USER_ID))
 
 async def get_unsent_predictions(limit=3):
-    db = await get_db()
-    async with db.execute("""SELECT p.match_id, p.sport, p.team1, p.team2, p.tournament, p.analysis, p.probabilities, p.recommendation, p.confidence, p.bet_type FROM predictions p LEFT JOIN sent_predictions s ON p.match_id = s.match_id WHERE s.id IS NULL AND p.confidence >= ? AND p.user_id = ? ORDER BY p.confidence DESC LIMIT ?""", (MIN_CONFIDENCE, SYSTEM_USER_ID, limit)) as cursor:
-        return await cursor.fetchall()
+    return await db_fetchall("""SELECT p.match_id, p.sport, p.team1, p.team2, p.tournament, p.analysis, p.probabilities, p.recommendation, p.confidence, p.bet_type FROM predictions p LEFT JOIN sent_predictions s ON p.match_id = s.match_id WHERE s.id IS NULL AND p.confidence >= ? AND p.user_id = ? ORDER BY p.confidence DESC LIMIT ?""", (MIN_CONFIDENCE, SYSTEM_USER_ID, limit))
 
 async def mark_prediction_sent(match_id, user_id):
-    db = await get_db()
-    await db.execute("INSERT INTO sent_predictions (match_id, user_id) VALUES (?, ?)", (match_id, user_id))
-    await db.commit()
+    await db_execute("INSERT INTO sent_predictions (match_id, user_id) VALUES (?, ?)", (match_id, user_id), commit=True)
 
 async def get_team_data(team_name: str, sport: str) -> dict:
-    db = await get_db()
     key = f"{sport}_{team_name}"
-    async with db.execute("SELECT elo, strength, goals_avg, form, games_played, goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away FROM team_ratings WHERE team_id = ?", (key,)) as cursor:
-        row = await cursor.fetchone()
+    row = await db_fetchone("SELECT elo, strength, goals_avg, form, games_played, goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away FROM team_ratings WHERE team_id = ?", (key,))
     if row:
         return {'elo_rating': row[0], 'strength': row[1], 'goals_avg': row[2], 'form': row[3] if row[3] is not None else DEFAULT_FORM, 'games_played': row[4] or 0, 'goals_scored_home': row[5] if row[5] is not None else DEFAULT_GOALS_AVG, 'goals_scored_away': row[6] if row[6] is not None else DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_home': row[7] if row[7] is not None else DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_away': row[8] if row[8] is not None else DEFAULT_GOALS_AVG}
     return {'elo_rating': DEFAULT_ELO, 'strength': DEFAULT_STRENGTH, 'goals_avg': DEFAULT_GOALS_AVG, 'form': DEFAULT_FORM, 'games_played': 0, 'goals_scored_home': DEFAULT_GOALS_AVG, 'goals_scored_away': DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_home': DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_away': DEFAULT_GOALS_AVG}
@@ -472,13 +497,12 @@ async def fetch_bookmaker_odds(team1: str, team2: str, sport: str):
 
 async def fetch_api_football_matches():
     if not FOOTBALL_API_KEY: return []
-    data = await fetch_json_with_retry("https://v3.football.api-sports.io/fixtures", headers={"x-apisports-key": FOOTBALL_API_KEY}, params={"date": datetime.now().strftime("%Y-%m-%d")})
+    data = await fetch_json_with_retry("https://v3.football.api-sports.io/fixtures", headers=_apisports_headers(FOOTBALL_API_KEY), params={"date": datetime.now().strftime("%Y-%m-%d")})
     matches = []
     if data:
         for f in data.get('response', []):
             try:
-                team1 = f.get('teams', {}).get('home', {}).get('name')
-                team2 = f.get('teams', {}).get('away', {}).get('name')
+                team1, team2 = _extract_team_names(f)
                 if not team1 or not team2: continue # Пропускаем, если команда неизвестна (TBD)
                 matches.append({
                     "id": f"af_{f['fixture']['id']}", 
@@ -491,20 +515,12 @@ async def fetch_api_football_matches():
     return matches
 
 async def fetch_football_matches():
-    cached = _matches_cache.get("matches_football")
-    if cached: return cached
-    matches = await fetch_api_football_matches()
-    _matches_cache.set("matches_football", matches)
-    return matches
+    return await _cache_get_or_set(_matches_cache, "matches_football", fetch_api_football_matches)
 
-async def fetch_pandascore_matches():
-    if not PANDASCORE_API_KEY: return []
-    cached = _matches_cache.get("matches_esports")
-    if cached: return cached
+async def _fetch_pandascore_upcoming():
     matches = []
-    headers = {"Authorization": f"Bearer {PANDASCORE_API_KEY}", "Accept": "application/json"}
     for game_code in ['cs2', 'dota2', 'lol', 'valorant']:
-        data = await fetch_json_with_retry(f"https://api.pandascore.co/{game_code}/matches/upcoming", headers=headers, params={"page[size]": 20, "sort": "begin_at"})
+        data = await fetch_json_with_retry(f"https://api.pandascore.co/{game_code}/matches/upcoming", headers=_pandascore_headers(), params={"page[size]": 20, "sort": "begin_at"})
         if data:
             for m in data:
                 if len(m.get('opponents', [])) >= 2:
@@ -513,8 +529,11 @@ async def fetch_pandascore_matches():
                     if t1 != 'Unknown' and t2 != 'Unknown':
                         match_format = m.get('series', {}).get('type', 3)
                         matches.append({"id": f"ps_{m['id']}", "team1": t1, "team2": t2, "date": m.get('begin_at', ''), "sport": "esports", "tournament": m.get('league', {}).get('name', 'Unknown'), "format": match_format})
-    _matches_cache.set("matches_esports", matches)
     return matches
+
+async def fetch_pandascore_matches():
+    if not PANDASCORE_API_KEY: return []
+    return await _cache_get_or_set(_matches_cache, "matches_esports", _fetch_pandascore_upcoming)
 
 async def fetch_api_sport_hockey_matches():
     """Сбор хоккейных матчей напрямую из API-Sport (Hockey)"""
@@ -524,7 +543,7 @@ async def fetch_api_sport_hockey_matches():
         return []
     
     url = "https://v1.hockey.api-sports.io/games"
-    headers = {"x-apisports-key": hockey_api_key}
+    headers = _apisports_headers(hockey_api_key)
     params = {"date": datetime.now().strftime("%Y-%m-%d")}
     
     data = await fetch_json_with_retry(url, headers=headers, params=params)
@@ -532,8 +551,7 @@ async def fetch_api_sport_hockey_matches():
     if data and data.get('response'):
         for g in data['response']:
             try:
-                team1 = g.get('teams', {}).get('home', {}).get('name')
-                team2 = g.get('teams', {}).get('away', {}).get('name')
+                team1, team2 = _extract_team_names(g)
                 if not team1 or not team2: continue
                 
                 game_date = g.get('game', {}).get('date')
@@ -566,18 +584,14 @@ async def fetch_hockey_matches():
         return real_matches
     return [{"id": "hk_301", "team1": "ЦСКА", "team2": "СКА", "date": datetime.now().strftime("%Y-%m-%d"), "sport": "hockey", "tournament": "КХЛ", "is_mock_source": True}]
 
-async def fetch_live_football_matches():
-    if not FOOTBALL_API_KEY: return []
-    cached = _live_cache.get("live_football")
-    if cached: return cached
-    data = await fetch_json_with_retry("https://v3.football.api-sports.io/fixtures", headers={"x-apisports-key": FOOTBALL_API_KEY}, params={"live": "all"})
+async def _fetch_live_football():
+    data = await fetch_json_with_retry("https://v3.football.api-sports.io/fixtures", headers=_apisports_headers(FOOTBALL_API_KEY), params={"live": "all"})
     live_matches = []
     if data:
         for f in data.get('response', []):
             if f.get('league', {}).get('id') in POPULAR_LIVE_LEAGUES:
                 try:
-                    team1 = f.get('teams', {}).get('home', {}).get('name')
-                    team2 = f.get('teams', {}).get('away', {}).get('name')
+                    team1, team2 = _extract_team_names(f)
                     if not team1 or not team2: continue
                     live_matches.append({
                         "id": f"af_{f['fixture']['id']}", "team1": team1, "team2": team2, 
@@ -589,15 +603,17 @@ async def fetch_live_football_matches():
                 except Exception:
                     continue
     limit = int(os.getenv("MAX_LIVE_FOOTBALL", 2))
-    live_matches = live_matches[:limit]
-    _live_cache.set("live_football", live_matches)
-    return live_matches
+    return live_matches[:limit]
+
+async def fetch_live_football_matches():
+    if not FOOTBALL_API_KEY: return []
+    return await _cache_get_or_set(_live_cache, "live_football", _fetch_live_football)
 
 async def fetch_live_esports_matches():
     if not PANDASCORE_API_KEY: return []
     cached = _live_cache.get("live_esports")
     if cached: return cached
-    data = await fetch_json_with_retry("https://api.pandascore.co/matches/running", headers={"Authorization": f"Bearer {PANDASCORE_API_KEY}", "Accept": "application/json"})
+    data = await fetch_json_with_retry("https://api.pandascore.co/matches/running", headers=_pandascore_headers())
     live_matches = []
     if data:
         for m in data:
@@ -614,11 +630,25 @@ async def fetch_live_esports_matches():
 
 # ==================== ОБУЧЕНИЕ (LOG-LOSS + XG) ====================
 
+_TEAM_RATING_UPSERT_SQL = ("INSERT INTO team_ratings (team_id, sport, elo, strength, goals_avg, form, games_played, "
+                           "goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away, updated_at) "
+                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+                           "ON CONFLICT(team_id) DO UPDATE SET elo=excluded.elo, goals_avg=excluded.goals_avg, "
+                           "form=excluded.form, games_played=excluded.games_played, updated_at=excluded.updated_at")
+
+async def _upsert_team_rating(db, team_id, sport, elo, new_goals, new_form, data):
+    await db.execute(_TEAM_RATING_UPSERT_SQL, (team_id, sport, elo, data['strength'], new_goals, new_form,
+                     data['games_played'] + 1, data['goals_scored_home'], data['goals_scored_away'],
+                     data['goals_conceded_home'], data['goals_conceded_away']))
+
+def _form_after_result(prev_form: float, points: float) -> float:
+    return prev_form * 0.7 + points * 0.3
+
 async def update_team_ratings_from_result(sport: str, team1: str, team2: str, score1: int, score2: int):
     db = await get_db()
     t1 = await get_team_data(team1, sport)
     t2 = await get_team_data(team2, sport)
-    expected1 = 1 / (1 + 10 ** ((t2['elo_rating'] - t1['elo_rating']) / 400))
+    expected1 = _elo_expected(t1['elo_rating'], t2['elo_rating'])
     actual1 = 1.0 if score1 > score2 else (0.0 if score1 < score2 else 0.5)
     new_elo1 = t1['elo_rating'] + 32 * (actual1 - expected1)
     new_elo2 = t2['elo_rating'] + 32 * ((1 - actual1) - (1 - expected1))
@@ -626,11 +656,11 @@ async def update_team_ratings_from_result(sport: str, team1: str, team2: str, sc
     adj_score2 = (score2 + t2['goals_avg']) / 2.0 if score2 > t2['goals_avg'] else score2
     new_goals1 = (t1['goals_avg'] * 0.8) + (adj_score1 * 0.2)
     new_goals2 = (t2['goals_avg'] * 0.8) + (adj_score2 * 0.2)
-    
-    await db.execute("INSERT INTO team_ratings (team_id, sport, elo, strength, goals_avg, form, games_played, goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(team_id) DO UPDATE SET elo=excluded.elo, goals_avg=excluded.goals_avg, form=excluded.form, games_played=excluded.games_played, updated_at=excluded.updated_at", 
-                     (f"{sport}_{team1}", sport, new_elo1, t1['strength'], new_goals1, (t1['form']*0.7 + (100 if actual1==1 else 50 if actual1==0.5 else 0)*0.3), t1['games_played']+1, t1['goals_scored_home'], t1['goals_scored_away'], t1['goals_conceded_home'], t1['goals_conceded_away']))
-    await db.execute("INSERT INTO team_ratings (team_id, sport, elo, strength, goals_avg, form, games_played, goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(team_id) DO UPDATE SET elo=excluded.elo, goals_avg=excluded.goals_avg, form=excluded.form, games_played=excluded.games_played, updated_at=excluded.updated_at", 
-                     (f"{sport}_{team2}", sport, new_elo2, t2['strength'], new_goals2, (t2['form']*0.7 + (100 if actual1==0 else 50 if actual1==0.5 else 0)*0.3), t2['games_played']+1, t2['goals_scored_home'], t2['goals_scored_away'], t2['goals_conceded_home'], t2['goals_conceded_away']))
+    points1 = 100 if actual1 == 1 else (50 if actual1 == 0.5 else 0)
+    points2 = 100 if actual1 == 0 else (50 if actual1 == 0.5 else 0)
+
+    await _upsert_team_rating(db, f"{sport}_{team1}", sport, new_elo1, new_goals1, _form_after_result(t1['form'], points1), t1)
+    await _upsert_team_rating(db, f"{sport}_{team2}", sport, new_elo2, new_goals2, _form_after_result(t2['form'], points2), t2)
     await db.commit()
 
 async def record_component_scores(match_id: str, components: dict, actual_result: str):
@@ -645,23 +675,26 @@ async def record_component_scores(match_id: str, components: dict, actual_result
         await db.execute("INSERT INTO model_component_scores (match_id, component, brier, checked_at) VALUES (?, ?, ?, datetime('now'))", (match_id, name, log_loss))
     await db.commit()
 
+def _prediction_matches_result(actual_result: str, text: str, draw_tokens=('Ничья',)) -> bool:
+    if actual_result == 'home_win': return 'П1' in text
+    if actual_result == 'away_win': return 'П2' in text
+    if actual_result == 'draw': return any(token in text for token in draw_tokens)
+    return False
+
 async def analyze_prediction_accuracy(match_id, actual_result):
     db = await get_db()
     async with db.execute("SELECT user_id, recommendation, confidence, probabilities FROM predictions WHERE match_id = ?", (match_id,)) as cursor:
         predictions = await cursor.fetchall()
     for pred in predictions:
         user_id, recommendation, confidence, probs_json = pred
-        is_correct = 0
-        if actual_result == 'home_win' and 'П1' in recommendation: is_correct = 1
-        elif actual_result == 'away_win' and 'П2' in recommendation: is_correct = 1
-        elif actual_result == 'draw' and ('Ничья' in recommendation or 'X' in recommendation): is_correct = 1
+        is_correct = 1 if _prediction_matches_result(actual_result, recommendation, draw_tokens=('Ничья', 'X')) else 0
         await db.execute("INSERT INTO prediction_results (match_id, user_id, prediction, actual_result, is_correct, confidence) VALUES (?, ?, ?, ?, ?, ?)", (match_id, user_id, recommendation, actual_result, is_correct, confidence))
     
     async with db.execute("SELECT id, user_id, bet_amount, odds, prediction FROM virtual_bets WHERE match_id = ? AND status = 0", (match_id,)) as cursor:
         v_bets = await cursor.fetchall()
     for vb in v_bets:
         bet_id, v_user_id, amount, odds, pred = vb[0], vb[1], vb[2], vb[3], vb[4]
-        won = (actual_result == 'home_win' and 'П1' in pred) or (actual_result == 'away_win' and 'П2' in pred) or (actual_result == 'draw' and 'Ничья' in pred)
+        won = _prediction_matches_result(actual_result, pred)
         if won:
             await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount * odds, v_user_id))
             await db.execute("UPDATE virtual_bets SET status = 1 WHERE id = ?", (bet_id,))
@@ -676,9 +709,7 @@ async def analyze_prediction_accuracy(match_id, actual_result):
         except: pass
 
 async def get_current_weights() -> dict | None:
-    db = await get_db()
-    async with db.execute("SELECT component, weight FROM model_weights") as cursor:
-        rows = await cursor.fetchall()
+    rows = await db_fetchall("SELECT component, weight FROM model_weights")
     if not rows: return None
     weights = {row[0]: row[1] for row in rows}
     required = set(DEFAULT_ENSEMBLE_WEIGHTS.keys())
@@ -702,7 +733,7 @@ async def compute_adaptive_weights():
     await db.commit()
 
 async def _check_af_result(fixture_id: str):
-    data = await fetch_json_with_retry("https://v3.football.api-sports.io/fixtures", headers={"x-apisports-key": FOOTBALL_API_KEY}, params={"id": fixture_id})
+    data = await fetch_json_with_retry("https://v3.football.api-sports.io/fixtures", headers=_apisports_headers(FOOTBALL_API_KEY), params={"id": fixture_id})
     if data:
         for f in data.get('response', []):
             if f.get('fixture', {}).get('status', {}).get('short') in ('FT', 'AET', 'PEN'):
@@ -711,7 +742,7 @@ async def _check_af_result(fixture_id: str):
     return None
 
 async def _check_ps_result(match_numeric_id: str):
-    data = await fetch_json_with_retry(f"https://api.pandascore.co/matches/{match_numeric_id}", headers={"Authorization": f"Bearer {PANDASCORE_API_KEY}", "Accept": "application/json"})
+    data = await fetch_json_with_retry(f"https://api.pandascore.co/matches/{match_numeric_id}", headers=_pandascore_headers())
     if data and data.get('status') == 'finished':
         results = data.get('results', [])
         opponents = data.get('opponents', [])
@@ -832,8 +863,7 @@ async def analyze_match(match):
     mc_text = ""
     if sport == 'esports':
         # Расчет котировок по картам
-        elo_diff = t1['elo_rating'] - t2['elo_rating']
-        p1_map_prob = 1 / (1 + 10 ** (-elo_diff / 400)) * 100
+        p1_map_prob = _elo_expected(t1['elo_rating'], t2['elo_rating']) * 100
         match_format = match.get('format', 3)
         map_markets = EsportsMapModel.calculate_maps(p1_map_prob, match_format)
         
@@ -887,6 +917,9 @@ async def collect_and_analyze_job():
 
 # ==================== ИНТЕРФЕЙС БОТА (ПАГИНАЦИЯ) ====================
 
+def _home_button() -> InlineKeyboardButton:
+    return InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_start")
+
 def get_main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔥 Live Матчи", callback_data="live_matches")],
@@ -899,7 +932,7 @@ def get_main_keyboard():
     ])
 
 def get_back_button():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_start")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[_home_button()]])
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -913,12 +946,10 @@ async def back_to_start(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "my_bank")
 async def show_bank(callback: types.CallbackQuery):
-    db = await get_db()
     user_id = callback.from_user.id
     
     # Безопасное извлечение баланса
-    async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
-        row = await cursor.fetchone()
+    row = await db_fetchone("SELECT balance FROM users WHERE user_id = ?", (user_id,))
     
     if not row:
         # Если пользователя нет в базе — добавляем его
@@ -928,8 +959,7 @@ async def show_bank(callback: types.CallbackQuery):
         balance = row[0]
         
     # Безопасное извлечение статистики
-    async with db.execute("SELECT COUNT(*) as total, SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) as won FROM virtual_bets WHERE user_id = ? AND status != 0", (user_id,)) as cursor:
-        stats = await cursor.fetchone()
+    stats = await db_fetchone("SELECT COUNT(*) as total, SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) as won FROM virtual_bets WHERE user_id = ? AND status != 0", (user_id,))
         
     if stats and stats[0] is not None:
         total_bets = stats[0]
@@ -979,11 +1009,14 @@ async def show_today(callback: types.CallbackQuery):
         text += f"{i}. <b>{pred[2]} vs {pred[3]}</b>\n   💰 {pred[7]} ({pred[8]}%)\n\n"
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_back_button())
 
+async def fetch_matches_by_sport(sport: str):
+    if sport == 'football': return await fetch_football_matches()
+    if sport == 'hockey': return await fetch_hockey_matches()
+    return await fetch_pandascore_matches()
+
 async def show_sport_page(callback: types.CallbackQuery, sport: str, page: int):
     sport_names = {'football': '⚽️ Футбол', 'hockey': '🏒 Хоккей', 'esports': '🎮 Киберспорт'}
-    if sport == 'football': matches = await fetch_football_matches()
-    elif sport == 'hockey': matches = await fetch_hockey_matches()
-    else: matches = await fetch_pandascore_matches()
+    matches = await fetch_matches_by_sport(sport)
     
     if not matches:
         await callback.message.edit_text("Матчи не найдены.", reply_markup=get_back_button())
@@ -1006,7 +1039,7 @@ async def show_sport_page(callback: types.CallbackQuery, sport: str, page: int):
     if nav_buttons:
         kb.append(nav_buttons)
         
-    kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_start")])
+    kb.append([_home_button()])
     
     await callback.message.edit_text(f"{sport_names[sport]} - Страница {page+1} (Выбери матч):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
@@ -1028,7 +1061,7 @@ async def show_match_analysis(callback: types.CallbackQuery):
     match_id, sport = parts[0], parts[1]
     await callback.answer("🧮 Анализирую...")
     
-    matches = await fetch_football_matches() if sport == 'football' else (await fetch_hockey_matches() if sport == 'hockey' else await fetch_pandascore_matches())
+    matches = await fetch_matches_by_sport(sport)
     match = next((m for m in matches if m['id'] == match_id), None)
     if not match:
         await callback.message.edit_text("Матч не найден.", reply_markup=get_back_button())
@@ -1055,7 +1088,7 @@ async def show_match_analysis(callback: types.CallbackQuery):
         if kelly_pct > 0: btn_text += f" | Value Bet {kelly_pct}%"
         kb.append([InlineKeyboardButton(text=btn_text, callback_data=cb_data)])
         
-    kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_start")])
+    kb.append([_home_button()])
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data.startswith("bet_"))
@@ -1082,15 +1115,13 @@ async def process_virtual_bet(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "settings")
 async def show_settings(callback: types.CallbackQuery):
-    db = await get_db()
-    async with db.execute("SELECT football, hockey, esports FROM user_settings WHERE user_id = ?", (callback.from_user.id,)) as cursor:
-        settings = await cursor.fetchone()
+    settings = await db_fetchone("SELECT football, hockey, esports FROM user_settings WHERE user_id = ?", (callback.from_user.id,))
     if not settings: return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"⚽️ Футбол [{'✅' if settings[0] else '❌'}]", callback_data=f"set_football_{settings[0]}"),
          InlineKeyboardButton(text=f"🏒 Хоккей [{'✅' if settings[1] else '❌'}]", callback_data=f"set_hockey_{settings[1]}"),
          InlineKeyboardButton(text=f"🎮 Киберспорт [{'✅' if settings[2] else '❌'}]", callback_data=f"set_esports_{settings[2]}")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_start")]
+        [_home_button()]
     ])
     await callback.message.edit_text("⚙️ <b>Настройки рассылки</b>", parse_mode="HTML", reply_markup=kb)
 
@@ -1098,9 +1129,7 @@ async def show_settings(callback: types.CallbackQuery):
 async def toggle_setting(callback: types.CallbackQuery):
     _, sport, val = callback.data.split("_")
     new_val = 0 if int(val) == 1 else 1
-    db = await get_db()
-    await db.execute(f"UPDATE user_settings SET {sport} = ? WHERE user_id = ?", (new_val, callback.from_user.id))
-    await db.commit()
+    await db_execute(f"UPDATE user_settings SET {sport} = ? WHERE user_id = ?", (new_val, callback.from_user.id), commit=True)
     await show_settings(callback)
 
 # ==================== ПЛАНИРОВЩИК И ЗАПУСК (БЕЗОПАСНАЯ РАССЫЛКА И BACKFILL В ФОНЕ) ====================
