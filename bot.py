@@ -10,6 +10,11 @@ from datetime import datetime, timedelta
 import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -92,8 +97,10 @@ async def get_db() -> aiosqlite.Connection:
             return _db_conn
         except Exception:
             logger.warning("Соединение с БД потеряно. Переподключаюсь...")
-            try: await _db_conn.close()
-            except: pass
+            try:
+                await _db_conn.close()
+            except Exception as close_err:
+                logger.debug(f"Ошибка при закрытии потерянного соединения с БД: {close_err}")
             _db_conn = None
             
     if _db_conn is None:
@@ -115,13 +122,18 @@ async def fetch_json_with_retry(url, headers=None, params=None, max_retries=3):
         try:
             async with session.get(url, headers=headers, params=params) as resp:
                 if resp.status == 429:
+                    logger.warning(f"Rate limited (429) {url}, попытка {attempt + 1}/{max_retries}")
                     await asyncio.sleep(2 ** attempt)
                     continue
-                if resp.status == 200: return await resp.json()
+                if resp.status == 200:
+                    return await resp.json()
+                body = (await resp.text())[:200]
+                logger.error(f"HTTP {resp.status} {url}: {body}")
                 return None
         except Exception as e:
-            logger.error(f"Network Error {url}: {e}")
+            logger.error(f"Network Error {url} (попытка {attempt + 1}/{max_retries}): {e}")
             await asyncio.sleep(1)
+    logger.error(f"Не удалось получить данные {url} после {max_retries} попыток")
     return None
 
 # ==================== ИИ-АГЕНТ (ИСПРАВЛЕНИЕ ПРОМПТА) ====================
@@ -152,6 +164,8 @@ async def generate_ai_explanation(team1, team2, rec, conf, stats_dict):
                 data = await resp.json()
                 text = data['choices'][0]['message']['content'].strip()
                 return f"🧠 <b>ИИ-аналитик:</b>\n<i>{text}</i>"
+            body = (await resp.text())[:200]
+            logger.error(f"OpenAI API HTTP {resp.status}: {body}")
     except Exception as e:
         logger.error(f"OpenAI API Error: {e}")
     return "🧠 <b>Почему мы так думаем:</b>\n• Математическая модель указывает на перевес."
@@ -486,7 +500,8 @@ async def fetch_api_football_matches():
                     "date": f['fixture']['date'], "sport": "football", 
                     "tournament": f.get('league', {}).get('name', 'Unknown')
                 })
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Пропущен футбольный матч (ошибка разбора): {e}")
                 continue
     return matches
 
@@ -550,7 +565,8 @@ async def fetch_api_sport_hockey_matches():
                     "sport": "hockey",
                     "tournament": g.get('league', {}).get('name', 'Hockey')
                 })
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Пропущен хоккейный матч (ошибка разбора): {e}")
                 continue
     elif data and data.get('errors'):
         logger.error(f"Ошибка API-Sport Hockey: {data.get('errors')}")
@@ -586,7 +602,8 @@ async def fetch_live_football_matches():
                         "minute": f.get('fixture', {}).get('status', {}).get('elapsed') or 0, 
                         "tournament": f.get('league', {}).get('name', 'Unknown'), "sport": "football"
                     })
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Пропущен live-матч (ошибка разбора): {e}")
                     continue
     limit = int(os.getenv("MAX_LIVE_FOOTBALL", 2))
     live_matches = live_matches[:limit]
@@ -673,7 +690,8 @@ async def analyze_prediction_accuracy(match_id, actual_result):
             first_probs = json.loads(predictions[0][3])
             components = first_probs.get('components')
             if components: await record_component_scores(match_id, components, actual_result)
-        except: pass
+        except Exception as e:
+            logger.error(f"Ошибка записи оценок компонентов для {match_id}: {e}")
 
 async def get_current_weights() -> dict | None:
     db = await get_db()
@@ -1102,6 +1120,19 @@ async def toggle_setting(callback: types.CallbackQuery):
     await db.execute(f"UPDATE user_settings SET {sport} = ? WHERE user_id = ?", (new_val, callback.from_user.id))
     await db.commit()
     await show_settings(callback)
+
+@dp.error()
+async def global_error_handler(event: types.ErrorEvent) -> bool:
+    logger.exception(f"Необработанная ошибка в обработчике: {event.exception}")
+    update = event.update
+    try:
+        if update.callback_query is not None:
+            await update.callback_query.answer("⚠️ Произошла ошибка. Попробуйте позже.", show_alert=True)
+        elif update.message is not None:
+            await update.message.answer("⚠️ Произошла ошибка. Попробуйте позже.")
+    except Exception as notify_err:
+        logger.debug(f"Не удалось уведомить пользователя об ошибке: {notify_err}")
+    return True
 
 # ==================== ПЛАНИРОВЩИК И ЗАПУСК (БЕЗОПАСНАЯ РАССЫЛКА И BACKFILL В ФОНЕ) ====================
 
