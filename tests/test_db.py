@@ -117,6 +117,13 @@ class TestUserSettings:
         assert set(football_users) == {1, 2}
         assert set(hockey_users) == {1}
 
+    async def test_get_users_for_sport_rejects_unknown_column(self, db):
+        # Guards against SQL injection via the interpolated column name.
+        with pytest.raises(ValueError):
+            await get_users_for_sport("football; DROP TABLE users;--")
+        with pytest.raises(ValueError):
+            await get_users_for_sport("password")
+
 
 class TestTeamData:
     async def test_get_team_data_defaults_for_unknown(self, db):
