@@ -75,6 +75,44 @@ def test_expected_calibration_error_zero_when_perfect():
     assert ev.expected_calibration_error(samples, n_bins=2) == pytest.approx(0.0)
 
 
+def test_select_value_bet_picks_positive_ev():
+    # model thinks home is 60% but book prices it at 2.0 (implied 50%) -> +EV
+    probs = (60, 25, 15)
+    odds = {"home": 2.0, "draw": 3.5, "away": 6.0}
+    vb = ev.select_value_bet(probs, odds, min_ev=0.0, kelly_multiplier=0.25, kelly_cap=0.05)
+    assert vb is not None
+    assert vb["outcome"] == "home"
+    assert vb["ev"] == pytest.approx(0.6 * 2.0 - 1)
+    assert 0 < vb["stake_fraction"] <= 0.05
+
+
+def test_select_value_bet_none_when_no_edge():
+    # fair/margined book, model matches implied probs -> no +EV bet
+    probs = (50, 30, 20)
+    odds = {"home": 1.9, "draw": 3.0, "away": 4.5}
+    assert ev.select_value_bet(probs, odds, min_ev=0.03) is None
+
+
+def test_select_value_bet_respects_min_ev_threshold():
+    probs = (52, 28, 20)
+    odds = {"home": 2.0, "draw": 3.5, "away": 5.0}  # home EV = 0.04
+    assert ev.select_value_bet(probs, odds, min_ev=0.10) is None
+    assert ev.select_value_bet(probs, odds, min_ev=0.01) is not None
+
+
+def test_select_value_bet_stake_capped():
+    probs = (90, 6, 4)
+    odds = {"home": 3.0, "draw": 5.0, "away": 8.0}  # huge edge -> full Kelly large
+    vb = ev.select_value_bet(probs, odds, kelly_multiplier=1.0, kelly_cap=0.05)
+    assert vb["stake_fraction"] == pytest.approx(0.05)  # capped
+
+
+def test_select_value_bet_ignores_missing_odds():
+    probs = (60, 25, 15)
+    odds = {"home": 0, "draw": 0, "away": 0}
+    assert ev.select_value_bet(probs, odds) is None
+
+
 def test_roi_summary():
     bets = [(1.0, 2.0, True), (1.0, 3.0, False), (1.0, 1.5, True)]
     r = ev.roi_summary(bets)

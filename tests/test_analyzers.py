@@ -103,3 +103,23 @@ class TestAnalyzeMatch:
         match = {"team1": "A", "team2": "B", "sport": "football", "tournament": "EPL"}
         pred = await analyze_match(match)
         assert "Дроп линии" in pred["analysis"]
+
+    async def test_value_bet_section_present(self, db):
+        match = {"team1": "A", "team2": "B", "sport": "football", "tournament": "EPL"}
+        pred = await analyze_match(match)
+        assert "Value Bet" in pred["analysis"]
+        # value_bet key is always present (None when no edge)
+        assert "value_bet" in pred["probabilities"]
+
+    async def test_value_bet_flagged_on_mispriced_odds(self, db, monkeypatch):
+        # Long odds on every outcome guarantees the model finds a +EV pick.
+        async def generous_odds(team1, team2, sport):
+            return {"home": 5.0, "draw": 6.0, "away": 5.0,
+                    "bookmaker": "Test", "is_mock": False, "is_dropping": False, "old_odds": 0}
+
+        monkeypatch.setattr(bot, "fetch_bookmaker_odds", generous_odds)
+        match = {"team1": "A", "team2": "B", "sport": "football", "tournament": "EPL"}
+        pred = await analyze_match(match)
+        vb = pred["probabilities"]["value_bet"]
+        assert vb is not None
+        assert vb["ev"] > 0 and vb["stake_fraction"] >= 0

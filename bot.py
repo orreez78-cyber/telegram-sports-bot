@@ -15,16 +15,41 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from dotenv import load_dotenv
+
+import evaluation
+
+load_dotenv()  # read a local .env into os.environ (no-op if the file is absent)
+
+# Value-betting configuration (see evaluation.select_value_bet).
+VALUE_BET_MIN_EV = 0.03        # require >=3% edge before recommending a bet
+VALUE_BET_KELLY_FRACTION = 0.25  # quarter-Kelly staking for safety
+VALUE_BET_KELLY_CAP = 0.05     # never stake more than 5% of bankroll on one bet
+VALUE_BET_MATURITY_GAMES = 20  # games of history before full stake confidence
 
 # ==================== НАСТРОЙКИ ====================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8933270591:AAGSJJkYl99icR7bwHv51-QlYf6Ff3CDMtM")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
-FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "3540a4964edea4e653d2a322ddec0270")
-FOOTBALL_DATA_ORG_KEY = os.getenv("FOOTBALL_DATA_ORG_KEY", "32fcb5cfa8c64b40b4baaf2319c2809c")
-PANDASCORE_API_KEY = os.getenv("PANDASCORE_API_KEY", "aXVsIwT4FSLepT021v4nrPAW9i-W-5y8Au0rrvUc4wg7bSf8IlY")
-THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "9fd1c123735ebb1f95339117edae2765")
-HOCKEY_API_KEY = os.getenv("HOCKEY_API_KEY", "123")
-HOCKEY_API_SPORTS = os.getenv("HOCKEY_API_SPORTS", "6834e018-33cd-44c2-8195-a442fe73063d")
+# Secrets come from the environment only (see .env.example). No fallback
+# defaults: committing live keys leaks them and makes rotation impossible.
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")
+FOOTBALL_DATA_ORG_KEY = os.getenv("FOOTBALL_DATA_ORG_KEY", "")
+PANDASCORE_API_KEY = os.getenv("PANDASCORE_API_KEY", "")
+THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "")
+HOCKEY_API_KEY = os.getenv("HOCKEY_API_KEY", "")
+HOCKEY_API_SPORTS = os.getenv("HOCKEY_API_SPORTS", "")
+
+def require_telegram_token():
+    """TELEGRAM_TOKEN is the only hard requirement to start the bot.
+
+    Checked at startup (not import time) so tests and offline tooling
+    (backtest.py) can import bot without any secrets configured.
+    """
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_TOKEN is not set. Copy .env.example to .env and fill it in, "
+            "or export the variable before starting the bot."
+        )
 
 MIN_CONFIDENCE = 50
 PREDICTIONS_PER_HOUR = 3
@@ -973,7 +998,26 @@ async def analyze_match(match):
 
     avg_games = (t1['games_played'] + t2['games_played']) / 2
     kelly = KellyCriterion.calculate_kelly(confidence, odds_val, avg_games) if not bookmaker_odds.get('is_mock') and odds_val > 0 else 0
-    
+
+    # Value bet: pick the highest +EV outcome vs the bookmaker line (not just
+    # the most likely one). This is what actually beats the margin over time.
+    value_bet, value_text = None, ""
+    if sport != 'esports' and not bookmaker_odds.get('is_mock'):
+        maturity = min(1.0, avg_games / VALUE_BET_MATURITY_GAMES)
+        value_bet = evaluation.select_value_bet(
+            (result['p1'], result.get('x', 0), result['p2']), bookmaker_odds,
+            min_ev=VALUE_BET_MIN_EV, kelly_multiplier=VALUE_BET_KELLY_FRACTION,
+            kelly_cap=VALUE_BET_KELLY_CAP, confidence=maturity,
+        )
+    if value_bet:
+        label = {'home': f"П1 ({match['team1']})", 'draw': "Ничья (X)", 'away': f"П2 ({match['team2']})"}[value_bet['outcome']]
+        value_text = (
+            f"💎 <b>Value Bet:</b> {label} @ {value_bet['odds']}\n"
+            f"   EV +{value_bet['ev'] * 100:.1f}% | ставка {value_bet['stake_fraction'] * 100:.1f}% банка (¼-Kelly)\n"
+        )
+    else:
+        value_text = "💎 <b>Value Bet:</b> нет перевеса над линией БК (ставка не рекомендуется)\n"
+
     stats_for_ai = {'form1': t1['form'], 'form2': t2['form'], 'lambda1': lambda1, 'lambda2': lambda2, 'kelly': kelly}
     ai_text = await generate_ai_explanation(match['team1'], match['team2'], rec, confidence, stats_for_ai)
     
@@ -1016,12 +1060,13 @@ async def analyze_match(match):
         f"🏆 <b>{match.get('tournament', '')}</b>\n"
         f"📊 П1={result['p1']}% | X={result.get('x',0)}% | П2={result['p2']}%\n"
         f"📈 Кэф: {odds_val} | Kelly: {kelly}%\n"
+        f"{value_text}"
         f"{drop_text}\n"
         f"{mc_text}"
         f"{ai_text}\n"
     )
     
-    return {'analysis': analysis, 'probabilities': {'p1': result['p1'], 'x': result.get('x', 0), 'p2': result['p2'], 'method': result['method'], 'components': result.get('components'), 'odds': odds_val, 'kelly': kelly, 'rec': rec, 'top_score': top_score if sport != 'esports' else 'N/A', 'btts': mc.get('btts_prob', 0) if sport != 'esports' else 0}, 'recommendation': rec, 'confidence': confidence, 'bet_type': 'Исход'}
+    return {'analysis': analysis, 'probabilities': {'p1': result['p1'], 'x': result.get('x', 0), 'p2': result['p2'], 'method': result['method'], 'components': result.get('components'), 'odds': odds_val, 'kelly': kelly, 'rec': rec, 'value_bet': value_bet, 'top_score': top_score if sport != 'esports' else 'N/A', 'btts': mc.get('btts_prob', 0) if sport != 'esports' else 0}, 'recommendation': rec, 'confidence': confidence, 'bet_type': 'Исход'}
 
 async def collect_and_analyze_job():
     db = await get_db()
@@ -1291,7 +1336,7 @@ async def recompute_weights_job():
 
 async def main():
     global bot
-    if not TELEGRAM_TOKEN: raise RuntimeError("TELEGRAM_TOKEN не задан")
+    require_telegram_token()
     bot = Bot(token=TELEGRAM_TOKEN)
     await init_db()
     

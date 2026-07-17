@@ -115,6 +115,37 @@ def expected_calibration_error(samples: Iterable[tuple[float, bool]], n_bins: in
     return sum(bin_["n"] / n * abs(bin_["avg_predicted"] - bin_["empirical"]) for bin_ in curve)
 
 
+def select_value_bet(probs: Sequence[float], odds: dict, min_ev: float = 0.0,
+                     kelly_multiplier: float = 0.25, kelly_cap: float = 0.05,
+                     confidence: float = 1.0):
+    """Pick the highest positive-EV 1X2 selection, or None if no edge exists.
+
+    This is the actual way to beat a bookmaker's margin: only bet when the
+    model's probability times the offered odds exceeds 1 (i.e. the book is
+    mispricing the outcome). Stake is fractional Kelly (default quarter-Kelly),
+    scaled by ``confidence`` (data maturity) and hard-capped at ``kelly_cap``
+    of bankroll to survive variance and model error.
+
+    ``probs`` is (p_home, p_draw, p_away) as fractions or percentages; ``odds``
+    is a dict with decimal ``home``/``draw``/``away`` keys.
+    Returns ``{outcome, ev, probability, odds, stake_fraction}`` or ``None``.
+    """
+    p = normalize(probs)
+    priced = {"home": odds.get("home", 0), "draw": odds.get("draw", 0), "away": odds.get("away", 0)}
+    best = None
+    for i, outcome in enumerate(OUTCOMES):
+        o = priced[outcome]
+        if not o or o <= 1.0:
+            continue
+        ev = expected_value(p[i], o)
+        if ev <= min_ev:
+            continue
+        if best is None or ev > best["ev"]:
+            stake = min(kelly_cap, kelly_fraction(p[i], o) * kelly_multiplier * max(0.0, min(1.0, confidence)))
+            best = {"outcome": outcome, "ev": ev, "probability": p[i], "odds": o, "stake_fraction": stake}
+    return best
+
+
 def roi_summary(bets: Iterable[tuple[float, float, bool]]) -> dict:
     """Summarize a set of settled bets.
 
