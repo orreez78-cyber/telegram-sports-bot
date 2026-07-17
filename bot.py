@@ -10,24 +10,34 @@ from datetime import datetime, timedelta
 import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ==================== НАСТРОЙКИ ====================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8933270591:AAGSJJkYl99icR7bwHv51-QlYf6Ff3CDMtM")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
-FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "3540a4964edea4e653d2a322ddec0270")
-FOOTBALL_DATA_ORG_KEY = os.getenv("FOOTBALL_DATA_ORG_KEY", "32fcb5cfa8c64b40b4baaf2319c2809c")
-PANDASCORE_API_KEY = os.getenv("PANDASCORE_API_KEY", "aXVsIwT4FSLepT021v4nrPAW9i-W-5y8Au0rrvUc4wg7bSf8IlY")
-THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "9fd1c123735ebb1f95339117edae2765")
-HOCKEY_API_KEY = os.getenv("HOCKEY_API_KEY", "123")
-HOCKEY_API_SPORTS = os.getenv("HOCKEY_API_SPORTS", "6834e018-33cd-44c2-8195-a442fe73063d")
+# Секреты берутся ТОЛЬКО из окружения (.env). Никаких значений по умолчанию,
+# чтобы ключи не попадали в исходный код и систему контроля версий.
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")
+FOOTBALL_DATA_ORG_KEY = os.getenv("FOOTBALL_DATA_ORG_KEY", "")
+PANDASCORE_API_KEY = os.getenv("PANDASCORE_API_KEY", "")
+THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "")
+HOCKEY_API_KEY = os.getenv("HOCKEY_API_KEY", "")
+HOCKEY_API_SPORTS = os.getenv("HOCKEY_API_SPORTS", "")
 
 MIN_CONFIDENCE = 50
 PREDICTIONS_PER_HOUR = 3
 DB_NAME = "sports_bot.db"
+
+# Разрешённые виды спорта = имена колонок в таблице user_settings.
+# Используется как белый список, чтобы исключить SQL-инъекцию через имена колонок.
+ALLOWED_SPORTS = ("football", "hockey", "esports")
 INITIAL_VIRTUAL_BALANCE = 1000.0
 
 SYSTEM_USER_ID = 0
@@ -384,6 +394,9 @@ async def place_virtual_bet(user_id: int, match_id: str, bet_amount: float, odds
     await db.commit()
 
 async def get_users_for_sport(sport: str):
+    if sport not in ALLOWED_SPORTS:
+        logger.warning(f"get_users_for_sport: недопустимый вид спорта '{sport}'")
+        return []
     db = await get_db()
     async with db.execute(f"SELECT u.user_id FROM users u JOIN user_settings s ON u.user_id = s.user_id WHERE s.{sport} = 1") as cursor:
         return [row[0] async for row in cursor]
@@ -1068,7 +1081,17 @@ async def process_virtual_bet(callback: types.CallbackQuery):
     except Exception:
         await callback.answer("Ошибка обработки ставки.", show_alert=True)
         return
-    
+
+    # callback_data управляется клиентом, поэтому сумма и коэффициент могут быть
+    # подделаны. Проверяем диапазоны, чтобы нельзя было «накрутить» баланс
+    # отрицательной ставкой или нереальным коэффициентом.
+    if not (math.isfinite(odds) and math.isfinite(amount)):
+        await callback.answer("Некорректные параметры ставки.", show_alert=True)
+        return
+    if amount <= 0 or odds <= 1.0 or odds > 1000:
+        await callback.answer("Некорректные параметры ставки.", show_alert=True)
+        return
+
     user_id = callback.from_user.id
     balance = await get_balance(user_id)
     if balance < amount:
@@ -1096,8 +1119,17 @@ async def show_settings(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("set_"))
 async def toggle_setting(callback: types.CallbackQuery):
-    _, sport, val = callback.data.split("_")
-    new_val = 0 if int(val) == 1 else 1
+    try:
+        _, sport, val = callback.data.split("_")
+        new_val = 0 if int(val) == 1 else 1
+    except (ValueError, AttributeError):
+        await callback.answer("Некорректные данные.", show_alert=True)
+        return
+    # sport берётся из callback_data (управляется клиентом), поэтому подставлять
+    # его в SQL можно только после проверки по белому списку колонок.
+    if sport not in ALLOWED_SPORTS:
+        await callback.answer("Недопустимая настройка.", show_alert=True)
+        return
     db = await get_db()
     await db.execute(f"UPDATE user_settings SET {sport} = ? WHERE user_id = ?", (new_val, callback.from_user.id))
     await db.commit()
