@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -35,6 +36,9 @@ DEFAULT_ELO = 1500
 DEFAULT_STRENGTH = 50
 DEFAULT_GOALS_AVG = 1.5
 DEFAULT_FORM = 50
+
+# Whitelist of user_settings columns that may be referenced by name in SQL.
+SPORT_COLUMNS = ("football", "hockey", "esports")
 
 POPULAR_LIVE_LEAGUES = [39, 140, 135, 78, 61, 2, 3]
 OPENLIGADB_LEAGUES = [
@@ -93,7 +97,7 @@ async def get_db() -> aiosqlite.Connection:
         except Exception:
             logger.warning("Соединение с БД потеряно. Переподключаюсь...")
             try: await _db_conn.close()
-            except: pass
+            except Exception: pass
             _db_conn = None
             
     if _db_conn is None:
@@ -384,6 +388,8 @@ async def place_virtual_bet(user_id: int, match_id: str, bet_amount: float, odds
     await db.commit()
 
 async def get_users_for_sport(sport: str):
+    if sport not in SPORT_COLUMNS:
+        raise ValueError(f"Unknown sport column: {sport!r}")
     db = await get_db()
     async with db.execute(f"SELECT u.user_id FROM users u JOIN user_settings s ON u.user_id = s.user_id WHERE s.{sport} = 1") as cursor:
         return [row[0] async for row in cursor]
@@ -673,7 +679,7 @@ async def analyze_prediction_accuracy(match_id, actual_result):
             first_probs = json.loads(predictions[0][3])
             components = first_probs.get('components')
             if components: await record_component_scores(match_id, components, actual_result)
-        except: pass
+        except Exception: pass
 
 async def get_current_weights() -> dict | None:
     db = await get_db()
@@ -1097,6 +1103,9 @@ async def show_settings(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("set_"))
 async def toggle_setting(callback: types.CallbackQuery):
     _, sport, val = callback.data.split("_")
+    if sport not in SPORT_COLUMNS:
+        await callback.answer("Неизвестная настройка.", show_alert=True)
+        return
     new_val = 0 if int(val) == 1 else 1
     db = await get_db()
     await db.execute(f"UPDATE user_settings SET {sport} = ? WHERE user_id = ?", (new_val, callback.from_user.id))
