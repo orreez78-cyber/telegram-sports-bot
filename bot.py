@@ -81,6 +81,8 @@ class TTLCache:
 _matches_cache = TTLCache(ttl_seconds=900, maxsize=500)
 _live_cache    = TTLCache(ttl_seconds=60,  maxsize=100)
 _odds_cache    = TTLCache(ttl_seconds=300, maxsize=1000)
+_odds_raw_ok_cache   = TTLCache(ttl_seconds=120, maxsize=50)   # сырой ответ /sport/odds — 1 запрос на sport_key
+_odds_authfail_cache = TTLCache(ttl_seconds=600, maxsize=20)   # circuit breaker на 401/403 (10 минут тишины)
 
 async def get_session() -> aiohttp.ClientSession:
     global _http_session
@@ -473,32 +475,54 @@ async def fetch_bookmaker_odds(team1, team2, sport):
     if not THE_ODDS_API_KEY: return fallback
     sport_key = THE_ODDS_SPORT_KEY.get(sport)
     if not sport_key: return fallback
+
+    if _odds_authfail_cache.get(sport_key):          # ключ уже отклоняли — не спамим API
+        return fallback
+
+    data = _odds_raw_ok_cache.get(sport_key)         # кэш сырого ответа (1 запрос на sport_key)
+    if data is None:
+        session = await get_session()
+        url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+        params = {'apiKey': THE_ODDS_API_KEY, 'regions': 'eu', 'markets': 'h2h', 'dateFormat': 'iso'}
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                elif resp.status in (401, 403):
+                    _odds_authfail_cache.set(sport_key, True)
+                    logger.warning(f"The-Odds-API: ключ не принят (HTTP {resp.status}) для {sport_key}. "
+                                   f"Проверьте ключ / активацию email / файл .env. Кэфы на заглушках 10 минут.")
+                    return fallback
+                else:
+                    logger.warning(f"HTTP {resp.status} for {url}"); data = None
+        except Exception as e:
+            logger.error(f"Network Error {url}: {e}"); data = None
+        _odds_raw_ok_cache.set(sport_key, data or [])
+        data = data or []
+    if not data: return fallback
+
     cache_key = f"odds_{sport}_{team1}_{team2}"
     cached = _odds_cache.get(cache_key)
-    if cached and not cached.get('is_mock'): return cached
     t1n, t2n = _normalize_name(team1), _normalize_name(team2)
-    data = await fetch_json_with_retry(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
-                                       params={'apiKey': THE_ODDS_API_KEY, 'regions': 'eu', 'markets': 'h2h', 'dateFormat': 'iso'})
-    if data:
-        for ev in data:
-            ht, at = ev.get('home_team',''), ev.get('away_team','')
-            if (_normalize_name(ht)==t1n and _normalize_name(at)==t2n) or (_normalize_name(ht)==t2n and _normalize_name(at)==t1n):
-                bh = ba = bd = 0
-                for bk in ev.get('bookmakers', []):
-                    for mk in bk.get('markets', []):
-                        for oc in mk.get('outcomes', []):
-                            pr = oc.get('price', 0)
-                            if pr > 0:
-                                if oc.get('name') == ht: bh = max(bh, pr)
-                                elif oc.get('name') == at: ba = max(ba, pr)
-                                elif oc.get('name') == 'Draw': bd = max(bd, pr)
-                if bh > 0 or ba > 0:
-                    is_drop, old = False, 0
-                    if cached and not cached.get('is_mock') and bh > 0:
-                        old = cached.get('home', 0)
-                        if old > 0 and (old-bh)/old >= 0.10: is_drop = True
-                    new = {'home': bh, 'draw': bd, 'away': ba, 'bookmaker': "Best Market", 'is_mock': False, 'is_dropping': is_drop, 'old_odds': old}
-                    _odds_cache.set(cache_key, new); return new
+    for ev in data:
+        ht, at = ev.get('home_team',''), ev.get('away_team','')
+        if (_normalize_name(ht)==t1n and _normalize_name(at)==t2n) or (_normalize_name(ht)==t2n and _normalize_name(at)==t1n):
+            bh = ba = bd = 0
+            for bk in ev.get('bookmakers', []):
+                for mk in bk.get('markets', []):
+                    for oc in mk.get('outcomes', []):
+                        pr = oc.get('price', 0)
+                        if pr > 0:
+                            if oc.get('name') == ht: bh = max(bh, pr)
+                            elif oc.get('name') == at: ba = max(ba, pr)
+                            elif oc.get('name') == 'Draw': bd = max(bd, pr)
+            if bh > 0 or ba > 0:
+                is_drop, old = False, 0
+                if cached and not cached.get('is_mock') and bh > 0:
+                    old = cached.get('home', 0)
+                    if old > 0 and (old-bh)/old >= 0.10: is_drop = True
+                new = {'home': bh, 'draw': bd, 'away': ba, 'bookmaker': "Best Market", 'is_mock': False, 'is_dropping': is_drop, 'old_odds': old}
+                _odds_cache.set(cache_key, new); return new
     return fallback
 
 async def fetch_api_football_matches():
