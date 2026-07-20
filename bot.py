@@ -579,7 +579,7 @@ async def fetch_highlightly_hockey_matches():
         except Exception: continue
     return out
  
-  async def fetch_football_matches():
+async def fetch_football_matches():
     c = _matches_cache.get("matches_football")
     if c: return c
     m = await fetch_api_football_matches()
