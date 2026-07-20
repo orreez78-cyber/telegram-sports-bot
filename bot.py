@@ -553,13 +553,13 @@ async def fetch_footballdata_matches():
             except Exception: continue
     return out
   async def fetch_highlightly_hockey_matches():
-    """Основной источник хоккея — Highlightly (live scores, odds, predictions, 170+ лиг)."""
+    """Основной источник хоккея — Highlightly."""
     if not HIGHLIGHTLY_API_KEY: return []
     headers = {"x-rapidapi-key": HIGHLIGHTLY_API_KEY, "Accept": "application/json"}
     params = {"date": datetime.now().strftime("%Y-%m-%d"), "limit": 100}
     resp = await fetch_json_with_retry(f"{HIGHLIGHTLY_HOCKEY_BASE}/matches", headers=headers, params=params)
     if not resp: return []
-    items = resp.get('data') if isinstance(resp, dict) else resp          # защита от смены обёртки
+    items = resp.get('data') if isinstance(resp, dict) else resp
     if not isinstance(items, list): items = []
     out, skip = [], {'postponed', 'cancelled', 'suspended', 'abandoned'}
     for m in items:
@@ -571,14 +571,14 @@ async def fetch_footballdata_matches():
             desc = (st.get('description') or '').lower(); report = (st.get('report') or '').lower()
             if desc in skip: continue
             if report in ('final','finished','aot','ot','so','ended','aet') or 'finished' in desc or 'final' in desc:
-                continue   # завершённые в расписание прогнозов не берём (обучение пойдёт через check)
+                continue
             league = m.get('league')
             lname = league if isinstance(league, str) else (league.get('name') if isinstance(league, dict) else 'Hockey')
             out.append({"id": f"hl_{m.get('id')}", "team1": t1, "team2": t2, "date": m.get('date', ''),
                         "sport": "hockey", "tournament": lname or 'Hockey'})
         except Exception: continue
     return out
-
+ 
   async def fetch_football_matches():
     c = _matches_cache.get("matches_football")
     if c: return c
