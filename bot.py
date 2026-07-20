@@ -21,9 +21,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8933270591:AAGSJJkYl99icR7bwHv51-Q
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "3540a4964edea4e653d2a322ddec0270")
 PANDASCORE_API_KEY = os.getenv("PANDASCORE_API_KEY", "aXVsIwT4FSLepT021v4nrPAW9i-W-5y8Au0rrvUc4wg7bSf8IlY")
-HOCKEY_API_SPORTS = os.getenv("HOCKEY_API_SPORTS", "3f2748a3-c083-4243-be9e-360412badaf4")
+HIGHLIGHTLY_API_KEY  = os.getenv("HIGHLIGHTLY_API_KEY", "3f2748a3-c083-4243-be9e-360412badaf4")
+HIGHLIGHTLY_HOCKEY_BASE = "https://nhl.highlightly.net"
 FOOTBALLDATA_KEY = os.getenv("FOOTBALLDATA_KEY", "fd_3cafc903b109cd31cc63ab3cd9edf3fad4068acad44dad7f")
-BASKETBALL_API_KEY = os.getenv("BASKETBALL_API_KEY", "b3ceed6ed0990c940289b87240115017f64888f0427cab857a3f244433758776")
+BASKETBALL_API_KEY = os.getenv("BASKETBALL_API_KEY", "3540a4964edea4e653d2a322ddec0270")
 MMA_API_KEY = os.getenv("MMA_API_KEY", "3540a4964edea4e653d2a322ddec0270")
 THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "9fd1c123735ebb1f95339117edae2765")
 
@@ -551,8 +552,34 @@ async def fetch_footballdata_matches():
                 out.append({"id": f"fd_{m['id']}", "team1": t1, "team2": t2, "date": m.get('utcDate',''), "sport": "football", "tournament": m.get('competition',{}).get('name','Football')})
             except Exception: continue
     return out
+  async def fetch_highlightly_hockey_matches():
+    """Основной источник хоккея — Highlightly (live scores, odds, predictions, 170+ лиг)."""
+    if not HIGHLIGHTLY_API_KEY: return []
+    headers = {"x-rapidapi-key": HIGHLIGHTLY_API_KEY, "Accept": "application/json"}
+    params = {"date": datetime.now().strftime("%Y-%m-%d"), "limit": 100}
+    resp = await fetch_json_with_retry(f"{HIGHLIGHTLY_HOCKEY_BASE}/matches", headers=headers, params=params)
+    if not resp: return []
+    items = resp.get('data') if isinstance(resp, dict) else resp          # защита от смены обёртки
+    if not isinstance(items, list): items = []
+    out, skip = [], {'postponed', 'cancelled', 'suspended', 'abandoned'}
+    for m in items:
+        try:
+            ht, at = m.get('homeTeam') or {}, m.get('awayTeam') or {}
+            t1 = ht.get('displayName') or ht.get('name'); t2 = at.get('displayName') or at.get('name')
+            if not t1 or not t2: continue
+            st = m.get('state') or {}
+            desc = (st.get('description') or '').lower(); report = (st.get('report') or '').lower()
+            if desc in skip: continue
+            if report in ('final','finished','aot','ot','so','ended','aet') or 'finished' in desc or 'final' in desc:
+                continue   # завершённые в расписание прогнозов не берём (обучение пойдёт через check)
+            league = m.get('league')
+            lname = league if isinstance(league, str) else (league.get('name') if isinstance(league, dict) else 'Hockey')
+            out.append({"id": f"hl_{m.get('id')}", "team1": t1, "team2": t2, "date": m.get('date', ''),
+                        "sport": "hockey", "tournament": lname or 'Hockey'})
+        except Exception: continue
+    return out
 
-async def fetch_football_matches():
+  async def fetch_football_matches():
     c = _matches_cache.get("matches_football")
     if c: return c
     m = await fetch_api_football_matches()
@@ -564,7 +591,7 @@ async def fetch_pandascore_matches():
     c = _matches_cache.get("matches_esports")
     if c: return c
     out, headers = [], {"Authorization": f"Bearer {PANDASCORE_API_KEY}", "Accept": "application/json"}
-    for g in ['cs2','dota2','lol','valorant']:
+        for g in ['csgo','dota2','lol','valorant']:   # CS2 у Pandascore идёт под префиксом /csgo/ (legacy)
         data = await fetch_json_with_retry(f"https://api.pandascore.co/{g}/matches/upcoming", headers=headers, params={"page[size]": 20, "sort": "begin_at"})
         if data:
             for m in data:
@@ -593,8 +620,10 @@ async def fetch_api_sport_hockey_matches():
 async def fetch_hockey_matches():
     c = _matches_cache.get("matches_hockey")
     if c: return c
-    real = await fetch_api_sport_hockey_matches()
-    if real: _matches_cache.set("matches_hockey", real); return real
+    real = await fetch_highlightly_hockey_matches()              # основной — Highlightly
+    if not real: real = await fetch_api_sport_hockey_matches()   # запасной — api-sports
+    if real:
+        _matches_cache.set("matches_hockey", real); return real
     return [{"id": "hk_301", "team1": "ЦСКА", "team2": "СКА", "date": datetime.now().strftime("%Y-%m-%d"), "sport": "hockey", "tournament": "КХЛ", "is_mock_source": True}]
 
 async def fetch_basketball_matches():
@@ -765,6 +794,30 @@ async def _check_ps_result(mid):
             if i1 in sb and i2 in sb: return sb[i1], sb[i2]
     return None
 
+async def _check_hl_result(mid):
+    """Проверка завершённого хоккей-матча через Highlightly /matches/{id}."""
+    headers = {"x-rapidapi-key": HIGHLIGHTLY_API_KEY, "Accept": "application/json"}
+    resp = await fetch_json_with_retry(f"{HIGHLIGHTLY_HOCKEY_BASE}/matches/{mid}", headers=headers)
+    if not resp: return None
+    if isinstance(resp, list):                       # by-id может вернуть массив или объект — берём оба
+        m = resp[0] if resp else None
+    elif isinstance(resp, dict):
+        m = resp['data'][0] if (isinstance(resp.get('data'), list) and resp['data']) else (resp if 'state' in resp else None)
+    else:
+        m = None
+    if not m: return None
+    st = m.get('state') or {}
+    desc = (st.get('description') or '').lower(); report = (st.get('report') or '').lower()
+    if desc in ('cancelled', 'abandoned', 'postponed'): return None
+    finished = report in ('final','finished','aot','ot','so','ended','aet') or ('finished' in desc) or ('final' in desc)
+    if not finished: return None
+    score = st.get('score')
+    cur = score.get('current') if isinstance(score, dict) else (score if isinstance(score, str) else '')
+    parts = [p.strip() for p in str(cur).replace('–', '-').split('-')]
+    if len(parts) != 2: return None
+    try: return int(parts[0]), int(parts[1])
+    except Exception: return None
+      
 async def _check_hk_result(gid):
     data = await fetch_json_with_retry("https://v1.hockey.api-sports.io/games", headers={"x-apisports-key": HOCKEY_API_SPORTS}, params={"id": gid})
     if data and data.get('response'):
@@ -806,8 +859,8 @@ async def check_and_update_finished_matches():
     db = await get_db()
     async with db.execute("SELECT match_id, sport, team1, team2, match_date FROM matches WHERE is_finished = 0 AND match_date < datetime('now', '-3 hours') AND match_date != ''") as c:
         matches = await c.fetchall()
-    checkers = {'af_': _check_af_result, 'fd_': _check_fd_result, 'ps_': _check_ps_result,
-                'hk_': _check_hk_result, 'bk_': _check_bk_result, 'mma_': _check_mma_result}
+        checkers = {'af_': _check_af_result, 'fd_': _check_fd_result, 'ps_': _check_ps_result,
+                'hk_': _check_hk_result, 'hl_': _check_hl_result, 'bk_': _check_bk_result, 'mma_': _check_mma_result}
     for m in matches:
         mid, sport, t1, t2 = m[0], m[1], m[2], m[3]
         pref = next((p for p in checkers if mid.startswith(p)), None)
