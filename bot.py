@@ -591,7 +591,7 @@ async def fetch_pandascore_matches():
     c = _matches_cache.get("matches_esports")
     if c: return c
     out, headers = [], {"Authorization": f"Bearer {PANDASCORE_API_KEY}", "Accept": "application/json"}
-        for g in ['csgo','dota2','lol','valorant']:   # CS2 у Pandascore идёт под префиксом /csgo/ (legacy)
+    for g in ['csgo','dota2','lol','valorant']:   # CS2 у Pandascore идёт под префиксом /csgo/ (legacy)
         data = await fetch_json_with_retry(f"https://api.pandascore.co/{g}/matches/upcoming", headers=headers, params={"page[size]": 20, "sort": "begin_at"})
         if data:
             for m in data:
