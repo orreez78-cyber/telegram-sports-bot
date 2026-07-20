@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest  # <-- было пропущено
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -19,16 +20,27 @@ from apscheduler.triggers.interval import IntervalTrigger
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8933270591:AAGSJJkYl99icR7bwHv51-QlYf6Ff3CDMtM")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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")
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "3540a4964edea4e653d2a322ddec0270")
-FOOTBALL_DATA_ORG_KEY = os.getenv("FOOTBALL_DATA_ORG_KEY", "32fcb5cfa8c64b40b4baaf2319c2809c")
 PANDASCORE_API_KEY = os.getenv("PANDASCORE_API_KEY", "aXVsIwT4FSLepT021v4nrPAW9i-W-5y8Au0rrvUc4wg7bSf8IlY")
+HOCKEY_API_SPORTS = os.getenv("HOCKEY_API_SPORTS", "3f2748a3-c083-4243-be9e-360412badaf4")
+FOOTBALLDATA_KEY = os.getenv("FOOTBALLDATA_KEY", "fd_3cafc903b109cd31cc63ab3cd9edf3fad4068acad44dad7f")
+BASKETBALL_API_KEY = os.getenv("BASKETBALL_API_KEY", "b3ceed6ed0990c940289b87240115017f64888f0427cab857a3f244433758776")
+MMA_API_KEY = os.getenv("MMA_API_KEY", "3540a4964edea4e653d2a322ddec0270")
 THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY", "9fd1c123735ebb1f95339117edae2765")
-HOCKEY_API_KEY = os.getenv("HOCKEY_API_KEY", "123")
-HOCKEY_API_SPORTS = os.getenv("HOCKEY_API_SPORTS", "6834e018-33cd-44c2-8195-a442fe73063d")
 
 MIN_CONFIDENCE = 50
 PREDICTIONS_PER_HOUR = 3
 DB_NAME = "sports_bot.db"
 INITIAL_VIRTUAL_BALANCE = 1000.0
+MAX_LIVE_FOOTBALL = int(os.getenv("MAX_LIVE_FOOTBALL", 5))
+MAX_LIVE_ESPORTS  = int(os.getenv("MAX_LIVE_ESPORTS", 3))
+ALLOWED_SPORTS = {'football', 'hockey', 'esports', 'basketball', 'mma'}     # whitelist (SQL + роутинг)
+ADAPT_MIN_SAMPLES = 30
+
+# Среднее «очков/голов за игру» для НОВЫХ команд (пока нет истории). Баскетбол = очки (~85), хоккей = шайбы (~2.5).
+SPORT_DEFAULT_GOALS = {'football': 1.5, 'hockey': 2.5, 'basketball': 85.0, 'esports': 1.5, 'mma': 1.0}
+# Маппинг sport -> ключ the-odds-api (для кэфов / Kelly / Value Bet)
+THE_ODDS_SPORT_KEY = {'football': 'soccer_epl', 'hockey': 'icehockey_nhl',
+                      'basketball': 'basketball_nba', 'mma': 'mma_mixed_martial_arts'}
 
 SYSTEM_USER_ID = 0
 DEFAULT_ELO = 1500
@@ -52,30 +64,23 @@ _http_session: aiohttp.ClientSession | None = None
 _db_conn: aiosqlite.Connection | None = None
 
 # ==================== КЭШ И УТИЛИТЫ ====================
-
 class TTLCache:
     def __init__(self, ttl_seconds=900, maxsize=1000):
-        self.cache = {}
-        self.ttl = ttl_seconds
-        self.maxsize = maxsize
-
+        self.cache, self.ttl, self.maxsize = {}, ttl_seconds, maxsize
     def get(self, key):
         if key in self.cache:
             val, ts = self.cache[key]
             if time.time() - ts < self.ttl: return val
             del self.cache[key]
         return None
-
     def set(self, key, val):
-        # Защита от переполнения памяти
         if len(self.cache) >= self.maxsize:
-            oldest_key = min(self.cache, key=lambda k: self.cache[k][1])
-            del self.cache[oldest_key]
+            oldest = min(self.cache, key=lambda k: self.cache[k][1]); del self.cache[oldest]
         self.cache[key] = (val, time.time())
 
 _matches_cache = TTLCache(ttl_seconds=900, maxsize=500)
-_live_cache = TTLCache(ttl_seconds=60, maxsize=100)
-_odds_cache = TTLCache(ttl_seconds=300, maxsize=1000)
+_live_cache    = TTLCache(ttl_seconds=60,  maxsize=100)
+_odds_cache    = TTLCache(ttl_seconds=300, maxsize=1000)
 
 async def get_session() -> aiohttp.ClientSession:
     global _http_session
@@ -83,28 +88,24 @@ async def get_session() -> aiohttp.ClientSession:
         _http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
     return _http_session
 
-# ИСПРАВЛЕНИЕ ЗАВИСАНИЯ БД (LIVENESS CHECK)
 async def get_db() -> aiosqlite.Connection:
     global _db_conn
     if _db_conn is not None:
         try:
-            await _db_conn.execute_fetchall("SELECT 1") # Проверка живости соединения
-            return _db_conn
+            await _db_conn.execute_fetchall("SELECT 1"); return _db_conn
         except Exception:
             logger.warning("Соединение с БД потеряно. Переподключаюсь...")
             try: await _db_conn.close()
-            except: pass
+            except Exception: pass
             _db_conn = None
-            
-    if _db_conn is None:
-        _db_conn = await aiosqlite.connect(DB_NAME)
-        _db_conn.row_factory = aiosqlite.Row
-        await _db_conn.execute("PRAGMA journal_mode=WAL")
+    _db_conn = await aiosqlite.connect(DB_NAME, timeout=10.0)
+    _db_conn.row_factory = aiosqlite.Row
+    await _db_conn.execute("PRAGMA journal_mode=WAL")
+    await _db_conn.execute("PRAGMA synchronous=NORMAL")
     return _db_conn
 
 def _normalize_date(dt_str: str) -> str:
-    if not dt_str: return ""
-    return dt_str.replace("T", " ").replace("Z", "")[:19]
+    return dt_str.replace("T", " ").replace("Z", "")[:19] if dt_str else ""
 
 def _normalize_name(name: str) -> str:
     return "".join(ch.lower() for ch in name if ch.isalnum())
@@ -115,32 +116,29 @@ async def fetch_json_with_retry(url, headers=None, params=None, max_retries=3):
         try:
             async with session.get(url, headers=headers, params=params) as resp:
                 if resp.status == 429:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
+                    await asyncio.sleep(2 ** attempt); continue
                 if resp.status == 200: return await resp.json()
+                logger.warning(f"HTTP {resp.status} for {url}")
                 return None
         except Exception as e:
             logger.error(f"Network Error {url}: {e}")
             await asyncio.sleep(1)
     return None
 
-# ==================== ИИ-АГЕНТ (ИСПРАВЛЕНИЕ ПРОМПТА) ====================
-
+# ==================== ИИ-АГЕНТ ====================
 async def generate_ai_explanation(team1, team2, rec, conf, stats_dict):
     if not OPENAI_API_KEY:
         explain = []
-        if stats_dict.get('form1', 50) - stats_dict.get('form2', 50) > 15: explain.append("Хозяева в отличной форме")
-        if stats_dict.get('lambda1', 1.5) > 1.8: explain.append("Высокий ожидаемый темп игры у хозяев")
+        if stats_dict.get('form1', 50) - stats_dict.get('form2', 50) > 15: explain.append("Первая команда в отличной форме")
+        if stats_dict.get('lambda1', 0) > stats_dict.get('lambda2', 0) * 1.2 and stats_dict.get('lambda1', 0) > 0: explain.append("Модель видит перевес по ожидаемым очкам/голам")
         if stats_dict.get('kelly', 0) > 0: explain.append("Найден Value Bet (перевес над линией БК)")
-        return "🧠 <b>Почему мы так думаем:</b>\n• " + "\n• ".join(explain) if explain else "🧠 <b>Почему мы так думаем:</b>\n• Команды сопоставимы по силам"
-
+        return "🧠 <b>Почему мы так думаем:</b>\n• " + "\n• ".join(explain) if explain else "🧠 <b>Почему мы так думаем:</b>\n• Соперники сопоставимы по силам"
     bet_status = "Обычная ставка" if stats_dict.get('kelly', 0) <= 0 else f"Value Bet (перевес над БК {stats_dict.get('kelly')}%)"
     prompt = (
         f"Ты профессиональный спортивный аналитик. Напиши строгое обоснование ставки в 2-3 предложениях.\n"
-        f"Матч: {team1} против {team2}. Прогноз: {rec} (уверенность {conf}%).\n"
-        f"Данные: Форма ({stats_dict.get('form1', 50):.0f} vs {stats_dict.get('form2', 50):.0f}), "
-        f"Ожидаемые голы ({stats_dict.get('lambda1', 1.5):.2f} vs {stats_dict.get('lambda2', 1.5):.2f}). "
-        f"Статус: {bet_status}\n\n"
+        f"Матч/бой: {team1} против {team2}. Прогноз: {rec} (уверенность {conf}%).\n"
+        f"Данные модели: форма ({stats_dict.get('form1',50):.0f} vs {stats_dict.get('form2',50):.0f}), "
+        f"ожидаемый темп/очки ({stats_dict.get('lambda1',0):.1f} vs {stats_dict.get('lambda2',0):.1f}). Статус: {bet_status}\n\n"
         f"Сформулируй ответ напрямую, как экспертный вывод. Без вступлений и нумерации."
     )
     try:
@@ -150,208 +148,209 @@ async def generate_ai_explanation(team1, team2, rec, conf, stats_dict):
         async with session.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                text = data['choices'][0]['message']['content'].strip()
-                return f"🧠 <b>ИИ-аналитик:</b>\n<i>{text}</i>"
+                return f"🧠 <b>ИИ-аналитик:</b>\n<i>{data['choices'][0]['message']['content'].strip()}</i>"
     except Exception as e:
         logger.error(f"OpenAI API Error: {e}")
     return "🧠 <b>Почему мы так думаем:</b>\n• Математическая модель указывает на перевес."
 
 # ==================== МАТЕМАТИЧЕСКИЕ МОДЕЛИ ====================
-
 class PoissonModel:
     @staticmethod
     def poisson_probability(k, lam):
         return (lam ** k * math.exp(-lam)) / math.factorial(k)
-
     @staticmethod
-    def calculate_match_probabilities(team1_goals_avg, team2_goals_avg):
-        p1_total, p2_total, draw_total = 0, 0, 0
-        rho = -0.1
-        team1_goals_avg = (team1_goals_avg * 0.8) + (1.35 * 0.2)
-        team2_goals_avg = (team2_goals_avg * 0.8) + (1.35 * 0.2)
-        team1_goals_avg = max(0.2, min(3.5, team1_goals_avg))
-        team2_goals_avg = max(0.2, min(3.5, team2_goals_avg))
-        tau_lambda1, tau_lambda2 = team1_goals_avg, team2_goals_avg
-        
-        for i in range(0, 8):
-            for j in range(0, 8):
-                p_i = PoissonModel.poisson_probability(i, team1_goals_avg)
-                p_j = PoissonModel.poisson_probability(j, team2_goals_avg)
-                p_score = p_i * p_j
-                if i == 0 and j == 0: p_score *= 1 - (rho * tau_lambda1 * tau_lambda2)
-                elif i == 0 and j == 1: p_score *= 1 + (rho * tau_lambda1)
-                elif i == 1 and j == 0: p_score *= 1 + (rho * tau_lambda2)
-                elif i == 1 and j == 1: p_score *= 1 - rho
-                if i > j: p1_total += p_score
-                elif i < j: p2_total += p_score
-                else: draw_total += p_score
-        total = p1_total + draw_total + p2_total
-        return (round(p1_total/total*100, 1), round(draw_total/total*100, 1), round(p2_total/total*100, 1), team1_goals_avg, team2_goals_avg)
+    def calculate_match_probabilities(t1g, t2g):
+        p1t = p2t = dt = 0.0; rho = -0.1
+        l1 = max(0.2, min(3.5, t1g*0.8 + 1.35*0.2)); l2 = max(0.2, min(3.5, t2g*0.8 + 1.35*0.2))
+        for i in range(8):
+            for j in range(8):
+                ps = PoissonModel.poisson_probability(i, l1) * PoissonModel.poisson_probability(j, l2)
+                if i == 0 and j == 0: ps *= 1 - (rho*l1*l2)
+                elif i == 0 and j == 1: ps *= 1 + (rho*l1)
+                elif i == 1 and j == 0: ps *= 1 + (rho*l2)
+                elif i == 1 and j == 1: ps *= 1 - rho
+                if i > j: p1t += ps
+                elif i < j: p2t += ps
+                else: dt += ps
+        tot = p1t + dt + p2t
+        return round(p1t/tot*100,1), round(dt/tot*100,1), round(p2t/tot*100,1), l1, l2
 
 class LivePoissonModel:
     @staticmethod
-    def calculate_live_probabilities(lambda1, lambda2, current_score1, current_score2, minute):
-        if minute > 90: minute = 90
-        if minute < 1: minute = 1
-        rem_lambda1 = max(0.01, lambda1 * (((90 - minute) / 90.0) ** 0.9))
-        rem_lambda2 = max(0.01, lambda2 * (((90 - minute) / 90.0) ** 0.9))
-        p_win, p_draw, p_loss = 0, 0, 0
+    def calculate_live_probabilities(l1, l2, s1, s2, minute):
+        minute = max(1, min(90, minute))
+        r1 = max(0.01, l1 * (((90-minute)/90.0)**0.9)); r2 = max(0.01, l2 * (((90-minute)/90.0)**0.9))
+        pw = pd = pl = 0.0
         for k1 in range(6):
             for k2 in range(6):
-                p_score = PoissonModel.poisson_probability(k1, rem_lambda1) * PoissonModel.poisson_probability(k2, rem_lambda2)
-                final1, final2 = current_score1 + k1, current_score2 + k2
-                if final1 > final2: p_win += p_score
-                elif final1 < final2: p_loss += p_score
-                else: p_draw += p_score
-        total = p_win + p_draw + p_loss
-        if total == 0: return 0, 0, 0, 0
-        p_over_2_5 = 0
-        current_total = current_score1 + current_score2
-        for k1 in range(6):
-            for k2 in range(6):
-                if current_total + k1 + k2 > 2: p_over_2_5 += PoissonModel.poisson_probability(k1, rem_lambda1) * PoissonModel.poisson_probability(k2, rem_lambda2)
-        return round(p_win/total*100, 1), round(p_draw/total*100, 1), round(p_loss/total*100, 1), round(p_over_2_5*100, 1)
+                ps = PoissonModel.poisson_probability(k1, r1) * PoissonModel.poisson_probability(k2, r2)
+                if s1+k1 > s2+k2: pw += ps
+                elif s1+k1 < s2+k2: pl += ps
+                else: pd += ps
+        tot = pw + pd + pl
+        if tot == 0: return 0, 0, 0, 0
+        po = sum(PoissonModel.poisson_probability(k1, r1)*PoissonModel.poisson_probability(k2, r2)
+                 for k1 in range(6) for k2 in range(6) if s1+s2+k1+k2 > 2)
+        return round(pw/tot*100,1), round(pd/tot*100,1), round(pl/tot*100,1), round(po*100,1)
 
 class MonteCarloSimulator:
     @staticmethod
     def _poisson_random(lam):
-        L = math.exp(-lam)
-        k = 0
-        p = 1.0
+        L, k, p = math.exp(-lam), 0, 1.0
         while True:
-            k += 1
-            p *= random.random()
+            k += 1; p *= random.random()
             if p <= L: return k - 1
-
     @staticmethod
-    def simulate_match(lambda1, lambda2, iterations=5000):
-        if lambda1 <= 0 or lambda2 <= 0: return {}
-        score_counts, btts_count, over_2_5_count = {}, 0, 0
-        dc_1x, dc_12, ah1_minus_1_5, ah2_plus_1 = 0, 0, 0, 0
+    def simulate_match(l1, l2, iterations=5000):
+        if l1 <= 0 or l2 <= 0: return {}
+        scores, btts, over = {}, 0, 0
+        dc1x, dc12, ah1, ah2 = 0, 0, 0, 0
         for _ in range(iterations):
-            s1 = min(MonteCarloSimulator._poisson_random(lambda1), 5)
-            s2 = min(MonteCarloSimulator._poisson_random(lambda2), 5)
-            score = f"{s1}:{s2}"
-            score_counts[score] = score_counts.get(score, 0) + 1
-            if s1 > 0 and s2 > 0: btts_count += 1
-            if s1 + s2 > 2: over_2_5_count += 1
-            if s1 >= s2: dc_1x += 1
-            if s1 != s2: dc_12 += 1
-            if s1 - s2 > 1.5: ah1_minus_1_5 += 1
-            if s2 - s1 > -1: ah2_plus_1 += 1
-        top_scores = sorted(score_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-        return {
-            'top_score': top_scores[0][0] if top_scores else "1:1", 'top_score_prob': round((top_scores[0][1] / iterations) * 100, 1) if top_scores else 0,
-            'btts_prob': round((btts_count / iterations) * 100, 1), 'over_2_5_prob': round((over_2_5_count / iterations) * 100, 1),
-            'dc_1x': round((dc_1x / iterations) * 100, 1), 'dc_12': round((dc_12 / iterations) * 100, 1),
-            'ah1_-1.5': round((ah1_minus_1_5 / iterations) * 100, 1), 'ah2_+1': round((ah2_plus_1 / iterations) * 100, 1)
-        }
+            s1 = min(MonteCarloSimulator._poisson_random(l1), 5); s2 = min(MonteCarloSimulator._poisson_random(l2), 5)
+            scores[f"{s1}:{s2}"] = scores.get(f"{s1}:{s2}", 0) + 1
+            if s1 > 0 and s2 > 0: btts += 1
+            if s1 + s2 > 2: over += 1
+            if s1 >= s2: dc1x += 1
+            if s1 != s2: dc12 += 1
+            if s1 - s2 > 1.5: ah1 += 1
+            if s2 - s1 > -1: ah2 += 1
+        top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
+        return {'top_score': top[0][0] if top else "1:1", 'top_score_prob': round(top[0][1]/iterations*100,1) if top else 0,
+                'btts_prob': round(btts/iterations*100,1), 'over_2_5_prob': round(over/iterations*100,1),
+                'dc_1x': round(dc1x/iterations*100,1), 'dc_12': round(dc12/iterations*100,1),
+                'ah1_-1.5': round(ah1/iterations*100,1), 'ah2_+1': round(ah2/iterations*100,1)}
 
 class BradleyTerryModel:
     @staticmethod
-    def win_probability(strength_a, strength_b):
-        exp_a, exp_b = math.exp(strength_a / 100), math.exp(strength_b / 100)
-        return round(exp_a / (exp_a + exp_b) * 100, 1)
+    def win_probability(a, b):
+        ea, eb = math.exp(a/100), math.exp(b/100); return round(ea/(ea+eb)*100, 1)
 
 class BookmakerFactor:
     @staticmethod
-    def calculate_probability(odds): return 50 if odds <= 0 else 100 / odds
+    def calculate_probability(o): return 50 if o <= 0 else 100/o
     @staticmethod
-    def get_bookmaker_influence(odds_home, odds_away, odds_draw=0):
-        p1, p2 = BookmakerFactor.calculate_probability(odds_home), BookmakerFactor.calculate_probability(odds_away)
-        draw = BookmakerFactor.calculate_probability(odds_draw) if odds_draw > 0 else 0
-        total = p1 + p2 + draw
-        if total > 0: p1, p2, draw = (p1/total*100, p2/total*100, draw/total*100)
-        return round(p1, 1), round(p2, 1), round(draw, 1)
+    def get_bookmaker_influence(oh, oa, od=0):
+        p1, p2 = BookmakerFactor.calculate_probability(oh), BookmakerFactor.calculate_probability(oa)
+        dx = BookmakerFactor.calculate_probability(od) if od > 0 else 0
+        t = p1 + p2 + dx
+        if t > 0: p1, p2, dx = (p1/t*100, p2/t*100, dx/t*100)
+        return round(p1,1), round(p2,1), round(dx,1)
 
 class KellyCriterion:
     @staticmethod
-    def calculate_kelly(bankroll_prob, bookmaker_odds, games_played=0):
-        if bookmaker_odds <= 1.0 or bankroll_prob <= 0: return 0
-        b, p = bookmaker_odds - 1, bankroll_prob / 100
-        kelly = (b * p - (1 - p)) / b
-        return max(0, round(kelly * min(1.0, games_played / 20.0) * 100, 1))
+    def calculate_kelly(prob, odds, games_played=0):
+        if odds <= 1.0 or prob <= 0: return 0
+        b, p = odds - 1, prob/100
+        k = (b*p - (1-p))/b
+        return max(0, round(k * min(1.0, games_played/20.0) * 100, 1))
 
-def calculate_draw_prob(p1_prob):
-    return max(15, round(33 - abs(50 - p1_prob) * 0.4, 1))
+def calculate_draw_prob(p1): return max(15, round(33 - abs(50 - p1)*0.4, 1))
 
 class EsportsModel:
+    W_ELO, W_STR, W_FORM = 0.45, 0.35, 0.20
     @staticmethod
-    def predict(team1_data, team2_data):
-        elo_diff = team1_data['elo_rating'] - team2_data['elo_rating']
-        p1_elo = 1 / (1 + 10 ** (-elo_diff / 400)) * 100
-        p1_strength = 50 + (team1_data['strength'] - team2_data['strength']) * 0.5
-        p1_form = 50 + (team1_data['form'] - team2_data['form']) * 0.3
-        p1 = max(20, min(80, (p1_elo * 0.40 + p1_strength * 0.30 + p1_form * 0.20 + 2 * 0.10)))
-        return {'p1': round(p1, 1), 'p2': round(100 - p1, 1), 'method': 'Esports Model (Elo)'}
+    def predict(t1, t2):
+        p1_elo = 1 / (1 + 10 ** (-(t1['elo_rating']-t2['elo_rating'])/400)) * 100
+        p1_str = 50 + (t1['strength']-t2['strength'])*0.5
+        p1_form = 50 + (t1['form']-t2['form'])*0.3
+        p1 = p1_elo*EsportsModel.W_ELO + p1_str*EsportsModel.W_STR + p1_form*EsportsModel.W_FORM
+        p1 = max(15, min(85, p1))
+        return {'p1': round(p1,1), 'p2': round(100-p1,1), 'method': 'Esports Model (Elo+Str+Form)'}
 
 class EsportsMapModel:
-    """Расчет тотала карт и фор для киберспорта (Bo3/Bo5)"""
     @staticmethod
-    def calculate_maps(p1_map_prob, match_format):
-        p1 = p1_map_prob / 100.0
-        p2 = 1.0 - p1
-        results = {}
-        
-        if match_format == 3: # Bo3
-            p_3_maps = (2 * (p1**2) * p2) + (2 * (p2**2) * p1)
-            results['tb_2_5'] = round(p_3_maps * 100, 1)
-            results['f1_minus_1_5'] = round((p1**2) * 100, 1)       # П1 выиграет 2:0
-            results['f2_plus_1_5'] = round((1.0 - (p1**2)) * 100, 1) # П2 выиграет хотя бы 1 карту
-            results['f1_plus_1_5'] = round((1.0 - (p2**2)) * 100, 1) # П1 выиграет хотя бы 1 карту
-            results['f2_minus_1_5'] = round((p2**2) * 100, 1)       # П2 выиграет 2:0
-        elif match_format == 5: # Bo5
-            p_4_maps = (3 * (p1**3) * p2) + (3 * (p2**3) * p1)
-            p_5_maps = (6 * (p1**3) * (p2**2)) + (6 * (p2**3) * (p1**2))
-            results['tb_3_5'] = round((p_4_maps + p_5_maps) * 100, 1)
-            results['f1_minus_1_5'] = round((p1**3) * 100, 1)
-            results['f2_plus_1_5'] = round((1.0 - (p1**3)) * 100, 1)
-            
-        return results
+    def calculate_maps(p1_map_prob, fmt):
+        p1, p2 = p1_map_prob/100.0, 1.0 - p1_map_prob/100.0; r = {}
+        if fmt == 3:
+            r['tb_2_5'] = round(((2*p1*p1*p2)+(2*p2*p2*p1))*100,1)
+            r['f1_minus_1_5'] = round(p1*p1*100,1); r['f2_plus_1_5'] = round((1-p1*p1)*100,1)
+            r['f1_plus_1_5'] = round((1-p2*p2)*100,1); r['f2_minus_1_5'] = round(p2*p2*100,1)
+        elif fmt == 5:
+            p4 = (3*p1**3*p2)+(3*p2**3*p1); p5 = (6*p1**3*p2**2)+(6*p2**3*p1**2)
+            r['tb_3_5'] = round((p4+p5)*100,1); r['f1_minus_1_5'] = round(p1**3*100,1); r['f2_plus_1_5'] = round((1-p1**3)*100,1)
+        return r
+
+class BasketballModel:
+    """Баскетбол: двухисходная модель (ничьих нет) + честные линии тотала и форы (норм. распр.)."""
+    @staticmethod
+    def _phi(z): return 0.5 * (1 + math.erf(z / math.sqrt(2)))
+    @staticmethod
+    def win_prob(t1, t2):
+        elo_p  = 1 / (1 + 10 ** (-(t1['elo_rating']-t2['elo_rating'])/400))
+        str_p  = 1 / (1 + math.exp(-(t1['strength']-t2['strength'])/25))
+        form_p = 1 / (1 + math.exp(-(t1['form']-t2['form'])/30))
+        return round(max(5, min(95, (0.45*elo_p + 0.35*str_p + 0.20*form_p)*100)), 1)
+    @staticmethod
+    def fair_lines(mu_total, mu_margin, sigma_total=14.0, sigma_margin=11.0):
+        over_line  = round(mu_total - 5.5, 1); under_line = round(mu_total + 5.5, 1)
+        p_over  = 1 - BasketballModel._phi((over_line + 0.5 - mu_total)/sigma_total)
+        p_under = BasketballModel._phi((under_line - 0.5 - mu_total)/sigma_total)
+        spread_line = round(mu_margin, 1)
+        p_cover = 1 - BasketballModel._phi((spread_line + 0.5 - mu_margin)/sigma_margin)
+        return {'mu_total': round(mu_total,1), 'mu_margin': round(mu_margin,1),
+                'over_line': over_line, 'p_over': round(p_over*100,1),
+                'under_line': under_line, 'p_under': round(p_under*100,1),
+                'spread_line': spread_line, 'p_cover_home': round(p_cover*100,1), 'p_cover_away': round((1-p_cover)*100,1)}
+
+class MmaModel:
+    """Бокс/ММА: исход боя (П1 / ничья / П2). Ничья редка (~2%)."""
+    @staticmethod
+    def predict(t1, t2):
+        elo_p  = 1 / (1 + 10 ** (-(t1['elo_rating']-t2['elo_rating'])/400))
+        str_p  = 1 / (1 + math.exp(-(t1['strength']-t2['strength'])/25))
+        form_p = 1 / (1 + math.exp(-(t1['form']-t2['form'])/30))
+        p = max(8, min(92, 0.50*elo_p + 0.30*str_p + 0.20*form_p))
+        draw = 2.0
+        return round(p*(100-draw)/100, 1), draw, round((100-p)*(100-draw)/100, 1)
 
 DEFAULT_ENSEMBLE_WEIGHTS = {'poisson': 0.35, 'bradley_terry': 0.25, 'form': 0.15, 'bookmaker': 0.25}
 
 class EnsemblePredictor:
-    def __init__(self, weights_override: dict | None = None):
-        self.weights_sports = weights_override or dict(DEFAULT_ENSEMBLE_WEIGHTS)
-
-    def predict(self, team1_data, team2_data, sport='football', bookmaker_odds=None):
+    """Только футбол/хоккей/киберспорт. Баскетбол и ММА считаются напрямую в analyze_match
+       (иначе Пуассон по ~85 очкам даст переполнение factorial)."""
+    def __init__(self, weights_override=None):
+        self.w = weights_override or dict(DEFAULT_ENSEMBLE_WEIGHTS)
+    def predict(self, t1, t2, sport='football', bookmaker_odds=None):
         if sport == 'esports':
-            result = EsportsModel.predict(team1_data, team2_data)
-            return {'p1': result['p1'], 'x': 0, 'p2': result['p2'], 'total_over_2.5': None, 'method': result['method'], 'components': None, 'mc': None}
-
-        p1_p, x_p, p2_p, adj_l1, adj_l2 = PoissonModel.calculate_match_probabilities(team1_data['goals_avg'], team2_data['goals_avg'])
-        p1_bt = BradleyTerryModel.win_probability(team1_data['strength'], team2_data['strength'])
-        x_bt = calculate_draw_prob(p1_bt)
-        p1_f = round(max(0.0, min(100.0, 50 + (team1_data['form'] - team2_data['form']) * 0.3)), 1)
-        x_f = calculate_draw_prob(p1_f)
-
-        bk_p1, bk_p2, bk_x = 0, 0, 0
+            r = EsportsModel.predict(t1, t2)
+            return {'p1': r['p1'], 'x': 0, 'p2': r['p2'], 'total_over_2.5': None, 'method': r['method'], 'components': None, 'mc': None}
+        p1_p, x_p, p2_p, l1, l2 = PoissonModel.calculate_match_probabilities(t1['goals_avg'], t2['goals_avg'])
+        p1_bt = BradleyTerryModel.win_probability(t1['strength'], t2['strength']); x_bt = calculate_draw_prob(p1_bt)
+        p1_f = round(max(0.0, min(100.0, 50 + (t1['form']-t2['form'])*0.3)), 1); x_f = calculate_draw_prob(p1_f)
+        bk1 = bk2 = bkx = 0
         if bookmaker_odds and not bookmaker_odds.get('is_mock'):
-            bk_p1, bk_p2, bk_x = BookmakerFactor.get_bookmaker_influence(bookmaker_odds.get('home', 0), bookmaker_odds.get('away', 0), bookmaker_odds.get('draw', 0))
-
-        w = self.weights_sports
-        eps = 1e-5
-        p1 = math.exp(w['poisson']*math.log(max(eps, p1_p)) + w['bradley_terry']*math.log(max(eps, p1_bt)) + w['form']*math.log(max(eps, p1_f)) + (w['bookmaker']*math.log(max(eps, bk_p1)) if bk_p1 > 0 else 0))
-        p2 = math.exp(w['poisson']*math.log(max(eps, p2_p)) + w['bradley_terry']*math.log(max(eps, 100-p1_bt)) + w['form']*math.log(max(eps, 100-p1_f)) + (w['bookmaker']*math.log(max(eps, bk_p2)) if bk_p2 > 0 else 0))
-        x  = math.exp(w['poisson']*math.log(max(eps, x_p))  + w['bradley_terry']*math.log(max(eps, x_bt))  + w['form']*math.log(max(eps, x_f))  + (w['bookmaker']*math.log(max(eps, bk_x))  if bk_x > 0 else 0))
-        
-        total = p1 + x + p2
-        p1, x, p2 = (round(p1/total*100, 1), round(x/total*100, 1), round(p2/total*100, 1))
-        mc_results = MonteCarloSimulator.simulate_match(adj_l1, adj_l2)
-        components = {'poisson': {'p1': p1_p, 'x': x_p, 'p2': p2_p}, 'bradley_terry': {'p1': p1_bt, 'x': x_bt, 'p2': 100-p1_bt}, 'form': {'p1': p1_f, 'x': x_f, 'p2': 100-p1_f}, 'bookmaker': {'p1': bk_p1, 'x': bk_x, 'p2': bk_p2} if bookmaker_odds and not bookmaker_odds.get('is_mock') else None}
-        return {'p1': p1, 'x': x, 'p2': p2, 'total_over_2.5': mc_results.get('over_2_5_prob', 0), 'method': 'Ансамбль (LOP + MC + DynTau)', 'components': components, 'mc': mc_results}
-        # Часть 2: База данных, Сбор данных (Best Odds + Dropping), Обучение
+            bk1, bk2, bkx = BookmakerFactor.get_bookmaker_influence(bookmaker_odds.get('home',0), bookmaker_odds.get('away',0), bookmaker_odds.get('draw',0))
+        w, eps = self.w, 1e-5
+        def lop(*terms): return math.exp(sum(wt*math.log(max(eps, v)) for wt, v in terms if v > 0))
+        p1 = lop((w['poisson'],p1_p),(w['bradley_terry'],p1_bt),(w['form'],p1_f),(w['bookmaker'],bk1))
+        p2 = lop((w['poisson'],p2_p),(w['bradley_terry'],100-p1_bt),(w['form'],100-p1_f),(w['bookmaker'],bk2))
+        x  = lop((w['poisson'],x_p),(w['bradley_terry'],x_bt),(w['form'],x_f),(w['bookmaker'],bkx))
+        tot = p1 + x + p2
+        p1, x, p2 = round(p1/tot*100,1), round(x/tot*100,1), round(p2/tot*100,1)
+        mc = MonteCarloSimulator.simulate_match(l1, l2)
+        comp = {'poisson': {'p1':p1_p,'x':x_p,'p2':p2_p}, 'bradley_terry': {'p1':p1_bt,'x':x_bt,'p2':100-p1_bt},
+                'form': {'p1':p1_f,'x':x_f,'p2':100-p1_f},
+                'bookmaker': {'p1':bk1,'x':bkx,'p2':bk2} if (bookmaker_odds and not bookmaker_odds.get('is_mock')) else None}
+        return {'p1':p1,'x':x,'p2':p2,'total_over_2.5':mc.get('over_2_5_prob',0),'method':'Ансамбль (LOP + MC + DynTau)','components':comp,'mc':mc}
 
 # ==================== БАЗА ДАННЫХ ====================
+async def migrate_db():
+    """Безопасно добавляет колонки рассылки для баскетбола и ММА (не трогает старые данные)."""
+    db = await get_db()
+    for col in ('basketball', 'mma'):
+        try:
+            await db.execute(f"ALTER TABLE user_settings ADD COLUMN {col} INTEGER DEFAULT 1")
+        except Exception:
+            pass
+    await db.commit()
 
 async def init_db():
     db = await get_db()
     await db.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, balance REAL DEFAULT 1000.0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     await db.execute("CREATE TABLE IF NOT EXISTS matches (match_id TEXT PRIMARY KEY, sport TEXT, team1 TEXT, team2 TEXT, match_date TEXT, tournament TEXT, team1_score INTEGER, team2_score INTEGER, is_finished INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    await db.execute("""CREATE TABLE IF NOT EXISTS predictions 
-        (match_id TEXT, sport TEXT, team1 TEXT, team2 TEXT, tournament TEXT, analysis TEXT, probabilities TEXT, 
-        recommendation TEXT, confidence REAL, bet_type TEXT, user_id INTEGER NOT NULL DEFAULT 0, 
+    await db.execute("""CREATE TABLE IF NOT EXISTS predictions
+        (match_id TEXT, sport TEXT, team1 TEXT, team2 TEXT, tournament TEXT, analysis TEXT, probabilities TEXT,
+        recommendation TEXT, confidence REAL, bet_type TEXT, user_id INTEGER NOT NULL DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (match_id, user_id))""")
     await db.execute("CREATE TABLE IF NOT EXISTS prediction_results (id INTEGER PRIMARY KEY AUTOINCREMENT, match_id TEXT, user_id INTEGER, prediction TEXT, actual_result TEXT, is_correct INTEGER, confidence REAL, checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
     await db.execute("CREATE TABLE IF NOT EXISTS sent_predictions (id INTEGER PRIMARY KEY AUTOINCREMENT, match_id TEXT, user_id INTEGER, sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
@@ -364,64 +363,73 @@ async def init_db():
     await db.execute("CREATE INDEX IF NOT EXISTS idx_predictions_created ON predictions(created_at, confidence)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_matches_finished ON matches(is_finished, match_date)")
     await db.commit()
+    await migrate_db()
 
-async def add_user(user_id: int, username: str):
+async def add_user(user_id, username):
     db = await get_db()
     await db.execute("INSERT OR IGNORE INTO users (user_id, username, balance) VALUES (?, ?, ?)", (user_id, username, INITIAL_VIRTUAL_BALANCE))
     await db.execute("INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)", (user_id,))
     await db.commit()
 
-async def get_balance(user_id: int) -> float:
+async def get_balance(user_id):
     db = await get_db()
-    async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
-        row = await cursor.fetchone()
+    async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as c:
+        row = await c.fetchone()
     return row[0] if row else 0.0
 
-async def place_virtual_bet(user_id: int, match_id: str, bet_amount: float, odds: float, prediction: str):
+async def place_virtual_bet(user_id, match_id, amount, odds, prediction):
     db = await get_db()
-    await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (bet_amount, user_id))
-    await db.execute("INSERT INTO virtual_bets (user_id, match_id, bet_amount, odds, prediction) VALUES (?, ?, ?, ?, ?)", (user_id, match_id, bet_amount, odds, prediction))
-    await db.commit()
+    cur = await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?", (amount, user_id, amount))
+    if cur.rowcount == 0: return False
+    await db.execute("INSERT INTO virtual_bets (user_id, match_id, bet_amount, odds, prediction) VALUES (?, ?, ?, ?, ?)", (user_id, match_id, amount, odds, prediction))
+    await db.commit(); return True
 
-async def get_users_for_sport(sport: str):
+async def get_users_for_sport(sport):
+    if sport not in ALLOWED_SPORTS: return []
     db = await get_db()
-    async with db.execute(f"SELECT u.user_id FROM users u JOIN user_settings s ON u.user_id = s.user_id WHERE s.{sport} = 1") as cursor:
-        return [row[0] async for row in cursor]
+    async with db.execute(f"SELECT u.user_id FROM users u JOIN user_settings s ON u.user_id = s.user_id WHERE s.{sport} = 1") as c:
+        return [row[0] async for row in c]
 
 async def save_prediction(match_id, sport, team1, team2, tournament, analysis, probs, rec, conf, bet_type, user_id=SYSTEM_USER_ID):
     db = await get_db()
-    await db.execute("""INSERT INTO predictions 
-        (match_id, sport, team1, team2, tournament, analysis, probabilities, recommendation, confidence, bet_type, user_id) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) 
-        ON CONFLICT(match_id, user_id) DO UPDATE SET 
-        analysis=excluded.analysis, probabilities=excluded.probabilities, 
+    await db.execute("""INSERT INTO predictions
+        (match_id, sport, team1, team2, tournament, analysis, probabilities, recommendation, confidence, bet_type, user_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(match_id, user_id) DO UPDATE SET analysis=excluded.analysis, probabilities=excluded.probabilities,
         recommendation=excluded.recommendation, confidence=excluded.confidence, bet_type=excluded.bet_type""",
         (match_id, sport, team1, team2, tournament, analysis, json.dumps(probs), rec, conf, bet_type, user_id))
     await db.commit()
 
 async def get_today_predictions():
     db = await get_db()
-    async with db.execute("SELECT match_id, sport, team1, team2, tournament, analysis, probabilities, recommendation, confidence, bet_type FROM predictions WHERE date(created_at) = date('now') AND confidence >= ? AND user_id = ? ORDER BY confidence DESC", (MIN_CONFIDENCE, SYSTEM_USER_ID)) as cursor:
-        return await cursor.fetchall()
+    async with db.execute("SELECT match_id, sport, team1, team2, tournament, analysis, probabilities, recommendation, confidence, bet_type FROM predictions WHERE date(created_at) = date('now') AND confidence >= ? AND user_id = ? ORDER BY confidence DESC", (MIN_CONFIDENCE, SYSTEM_USER_ID)) as c:
+        return await c.fetchall()
 
 async def get_unsent_predictions(limit=3):
     db = await get_db()
-    async with db.execute("""SELECT p.match_id, p.sport, p.team1, p.team2, p.tournament, p.analysis, p.probabilities, p.recommendation, p.confidence, p.bet_type FROM predictions p LEFT JOIN sent_predictions s ON p.match_id = s.match_id WHERE s.id IS NULL AND p.confidence >= ? AND p.user_id = ? ORDER BY p.confidence DESC LIMIT ?""", (MIN_CONFIDENCE, SYSTEM_USER_ID, limit)) as cursor:
-        return await cursor.fetchall()
+    async with db.execute("""SELECT p.match_id, p.sport, p.team1, p.team2, p.tournament, p.analysis, p.probabilities, p.recommendation, p.confidence, p.bet_type
+        FROM predictions p LEFT JOIN sent_predictions s ON p.match_id = s.match_id
+        WHERE s.id IS NULL AND p.confidence >= ? AND p.user_id = ? ORDER BY p.confidence DESC LIMIT ?""", (MIN_CONFIDENCE, SYSTEM_USER_ID, limit)) as c:
+        return await c.fetchall()
 
 async def mark_prediction_sent(match_id, user_id):
     db = await get_db()
-    await db.execute("INSERT INTO sent_predictions (match_id, user_id) VALUES (?, ?)", (match_id, user_id))
-    await db.commit()
+    await db.execute("INSERT INTO sent_predictions (match_id, user_id) VALUES (?, ?)", (match_id, user_id)); await db.commit()
 
-async def get_team_data(team_name: str, sport: str) -> dict:
+async def get_team_data(team_name, sport):
     db = await get_db()
-    key = f"{sport}_{team_name}"
-    async with db.execute("SELECT elo, strength, goals_avg, form, games_played, goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away FROM team_ratings WHERE team_id = ?", (key,)) as cursor:
-        row = await cursor.fetchone()
+    d = SPORT_DEFAULT_GOALS.get(sport, DEFAULT_GOALS_AVG)
+    async with db.execute("SELECT elo, strength, goals_avg, form, games_played, goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away FROM team_ratings WHERE team_id = ?", (f"{sport}_{team_name}",)) as c:
+        row = await c.fetchone()
     if row:
-        return {'elo_rating': row[0], 'strength': row[1], 'goals_avg': row[2], 'form': row[3] if row[3] is not None else DEFAULT_FORM, 'games_played': row[4] or 0, 'goals_scored_home': row[5] if row[5] is not None else DEFAULT_GOALS_AVG, 'goals_scored_away': row[6] if row[6] is not None else DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_home': row[7] if row[7] is not None else DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_away': row[8] if row[8] is not None else DEFAULT_GOALS_AVG}
-    return {'elo_rating': DEFAULT_ELO, 'strength': DEFAULT_STRENGTH, 'goals_avg': DEFAULT_GOALS_AVG, 'form': DEFAULT_FORM, 'games_played': 0, 'goals_scored_home': DEFAULT_GOALS_AVG, 'goals_scored_away': DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_home': DEFAULT_GOALS_AVG * 0.8, 'goals_conceded_away': DEFAULT_GOALS_AVG}
+        return {'elo_rating': row[0], 'strength': row[1], 'goals_avg': row[2],
+                'form': row[3] if row[3] is not None else DEFAULT_FORM, 'games_played': row[4] or 0,
+                'goals_scored_home': row[5] if row[5] is not None else d,
+                'goals_scored_away': row[6] if row[6] is not None else d*0.9,
+                'goals_conceded_home': row[7] if row[7] is not None else d*0.9,
+                'goals_conceded_away': row[8] if row[8] is not None else d}
+    return {'elo_rating': DEFAULT_ELO, 'strength': DEFAULT_STRENGTH, 'goals_avg': d, 'form': DEFAULT_FORM, 'games_played': 0,
+            'goals_scored_home': d, 'goals_scored_away': d*0.9, 'goals_conceded_home': d*0.9, 'goals_conceded_away': d}
 
 async def garbage_collector_job():
     db = await get_db()
@@ -429,464 +437,544 @@ async def garbage_collector_job():
     await db.execute("DELETE FROM predictions WHERE created_at < datetime('now', '-30 days')")
     await db.commit()
 
-# ==================== СБОР ДАННЫХ И КОЭФФИЦИЕНТОВ (BEST ODDS + DROPPING) ====================
+async def get_learning_dashboard():
+    db = await get_db()
+    async with db.execute("SELECT COUNT(*) FROM matches WHERE is_finished = 1") as c: finished = (await c.fetchone())[0] or 0
+    async with db.execute("SELECT COUNT(*), SUM(is_correct) FROM prediction_results WHERE user_id = 0") as c:
+        r = await c.fetchone()
+    total_p, correct_p = r[0] or 0, int(r[1] or 0)
+    acc = round(correct_p/total_p*100, 1) if total_p else 0.0
+    async with db.execute("SELECT component, AVG(brier) AS loss, COUNT(*) AS n FROM model_component_scores GROUP BY component ORDER BY loss ASC") as c:
+        comp_rows = await c.fetchall()
+    async with db.execute("SELECT component, weight FROM model_weights") as c: w_rows = await c.fetchall()
+    async with db.execute("SELECT COUNT(*), SUM(CASE WHEN games_played>0 THEN 1 ELSE 0 END) FROM team_ratings") as c:
+        tr = await c.fetchone()
+    teams_total, teams_learned = tr[0] or 0, int(tr[1] or 0)
+    async with db.execute("SELECT COUNT(*) FROM model_component_scores") as c: comp_total = (await c.fetchone())[0] or 0
+    adaptive_on = bool(w_rows) and comp_total >= ADAPT_MIN_SAMPLES
+    status = "🟢 <b>Адаптивные веса активны</b> — ансамбль перенастраивается по точности компонент." if adaptive_on \
+             else f"🟡 <b>Накопление данных</b> — собрано {comp_total} оценок компонент (нужно {ADAPT_MIN_SAMPLES} для авто-адаптации)."
+    comp_block = "\n🧩 <b>Точность компонент ансамбля</b> (log-loss, ↓ лучше):\n" if comp_rows else "\n🧩 <b>Компоненты:</b> пока нет завершённых матчей для оценки.\n"
+    for name, loss, n in comp_rows:
+        bar = "🟢" if loss < 0.9 else ("🟡" if loss < 1.1 else "🔴")
+        comp_block += f"   {bar} {name}: {loss:.3f}  (n={n})\n"
+    weight_block = ("⚖️ <b>Веса ансамбля (авто):</b> " + ", ".join(f"{k}={v:.2f}" for k, v in w_rows) + "\n") if w_rows \
+                   else "⚖️ <b>Веса ансамбля:</b> стандартные (" + ", ".join(f"{k}={v}" for k, v in DEFAULT_ENSEMBLE_WEIGHTS.items()) + ")\n"
+    return (f"📚 <b>Обучение модели</b>\n\n{status}\n\n"
+            f"✅ Обработано результатов матчей: <b>{finished}</b>\n"
+            f"🎯 Точность прогнозов бота (Win-Rate): <b>{acc}%</b>  ({correct_p}/{total_p})\n"
+            f"🏟 Команд/бойцов в базе рейтингов: <b>{teams_total}</b> (обучено играми: {teams_learned})\n\n"
+            f"{weight_block}{comp_block}\n"
+            "💡 <i>Чем больше матчей завершается — тем точнее рейтинги (Elo), а веса ансамбля смещаются в пользу самых точных компонент.</i>")
 
-async def fetch_bookmaker_odds(team1: str, team2: str, sport: str):
+# ==================== СБОР ДАННЫХ И КОЭФФИЦИЕНТОВ ====================
+async def fetch_bookmaker_odds(team1, team2, sport):
     fallback = {'home': 2.0, 'draw': 3.5, 'away': 3.0, 'bookmaker': 'Mock', 'is_mock': True, 'is_dropping': False, 'old_odds': 0}
     if not THE_ODDS_API_KEY: return fallback
-    sport_key = 'soccer_epl' if sport == 'football' else ('icehockey_nhl' if sport == 'hockey' else None)
+    sport_key = THE_ODDS_SPORT_KEY.get(sport)
     if not sport_key: return fallback
-
-    cache_key = f"odds_{team1}_{team2}"
-    cached_odds = _odds_cache.get(cache_key)
-
-    t1_norm, t2_norm = _normalize_name(team1), _normalize_name(team2)
-    data = await fetch_json_with_retry(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds", params={'apiKey': THE_ODDS_API_KEY, 'regions': 'eu', 'markets': 'h2h', 'dateFormat': 'iso'})
-    
+    cache_key = f"odds_{sport}_{team1}_{team2}"
+    cached = _odds_cache.get(cache_key)
+    if cached and not cached.get('is_mock'): return cached
+    t1n, t2n = _normalize_name(team1), _normalize_name(team2)
+    data = await fetch_json_with_retry(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
+                                       params={'apiKey': THE_ODDS_API_KEY, 'regions': 'eu', 'markets': 'h2h', 'dateFormat': 'iso'})
     if data:
-        for event in data:
-            home_team, away_team = event.get('home_team', ''), event.get('away_team', '')
-            if (_normalize_name(home_team) == t1_norm and _normalize_name(away_team) == t2_norm) or (_normalize_name(home_team) == t2_norm and _normalize_name(away_team) == t1_norm):
-                best_home, best_away, best_draw = 0, 0, 0
-                for bk in event.get('bookmakers', []):
-                    for market in bk.get('markets', []):
-                        for outcome in market.get('outcomes', []):
-                            price = outcome.get('price', 0)
-                            if price > 0:
-                                if outcome.get('name') == home_team: best_home = max(best_home, price)
-                                elif outcome.get('name') == away_team: best_away = max(best_away, price)
-                                elif outcome.get('name') == 'Draw': best_draw = max(best_draw, price)
-                
-                if best_home > 0 or best_away > 0:
-                    is_dropping = False
-                    old_odds = 0
-                    if cached_odds and not cached_odds.get('is_mock') and best_home > 0:
-                        old_odds = cached_odds.get('home', 0)
-                        if old_odds > 0 and (old_odds - best_home) / old_odds >= 0.10:
-                            is_dropping = True
-                    
-                    new_odds = {'home': best_home, 'draw': best_draw, 'away': best_away, 'bookmaker': "Best Market", 'is_mock': False, 'is_dropping': is_dropping, 'old_odds': old_odds}
-                    _odds_cache.set(cache_key, new_odds)
-                    return new_odds
+        for ev in data:
+            ht, at = ev.get('home_team',''), ev.get('away_team','')
+            if (_normalize_name(ht)==t1n and _normalize_name(at)==t2n) or (_normalize_name(ht)==t2n and _normalize_name(at)==t1n):
+                bh = ba = bd = 0
+                for bk in ev.get('bookmakers', []):
+                    for mk in bk.get('markets', []):
+                        for oc in mk.get('outcomes', []):
+                            pr = oc.get('price', 0)
+                            if pr > 0:
+                                if oc.get('name') == ht: bh = max(bh, pr)
+                                elif oc.get('name') == at: ba = max(ba, pr)
+                                elif oc.get('name') == 'Draw': bd = max(bd, pr)
+                if bh > 0 or ba > 0:
+                    is_drop, old = False, 0
+                    if cached and not cached.get('is_mock') and bh > 0:
+                        old = cached.get('home', 0)
+                        if old > 0 and (old-bh)/old >= 0.10: is_drop = True
+                    new = {'home': bh, 'draw': bd, 'away': ba, 'bookmaker': "Best Market", 'is_mock': False, 'is_dropping': is_drop, 'old_odds': old}
+                    _odds_cache.set(cache_key, new); return new
     return fallback
 
 async def fetch_api_football_matches():
     if not FOOTBALL_API_KEY: return []
     data = await fetch_json_with_retry("https://v3.football.api-sports.io/fixtures", headers={"x-apisports-key": FOOTBALL_API_KEY}, params={"date": datetime.now().strftime("%Y-%m-%d")})
-    matches = []
+    out = []
     if data:
         for f in data.get('response', []):
             try:
-                team1 = f.get('teams', {}).get('home', {}).get('name')
-                team2 = f.get('teams', {}).get('away', {}).get('name')
-                if not team1 or not team2: continue # Пропускаем, если команда неизвестна (TBD)
-                matches.append({
-                    "id": f"af_{f['fixture']['id']}", 
-                    "team1": team1, "team2": team2, 
-                    "date": f['fixture']['date'], "sport": "football", 
-                    "tournament": f.get('league', {}).get('name', 'Unknown')
-                })
-            except Exception:
-                continue
-    return matches
+                t1 = f.get('teams',{}).get('home',{}).get('name'); t2 = f.get('teams',{}).get('away',{}).get('name')
+                if not t1 or not t2: continue
+                out.append({"id": f"af_{f['fixture']['id']}", "team1": t1, "team2": t2, "date": f['fixture']['date'], "sport": "football", "tournament": f.get('league',{}).get('name','Unknown')})
+            except Exception: continue
+    return out
+
+async def fetch_footballdata_matches():
+    if not FOOTBALLDATA_KEY: return []
+    today = datetime.now().strftime("%Y-%m-%d")
+    data = await fetch_json_with_retry("https://api.football-data.org/v4/matches", headers={"X-Auth-Token": FOOTBALLDATA_KEY}, params={"dateFrom": today, "dateTo": today})
+    out = []
+    if data:
+        for m in data.get('matches', []):
+            try:
+                t1 = m.get('homeTeam',{}).get('name'); t2 = m.get('awayTeam',{}).get('name')
+                if not t1 or not t2 or m.get('status') != 'SCHEDULED': continue
+                out.append({"id": f"fd_{m['id']}", "team1": t1, "team2": t2, "date": m.get('utcDate',''), "sport": "football", "tournament": m.get('competition',{}).get('name','Football')})
+            except Exception: continue
+    return out
 
 async def fetch_football_matches():
-    cached = _matches_cache.get("matches_football")
-    if cached: return cached
-    matches = await fetch_api_football_matches()
-    _matches_cache.set("matches_football", matches)
-    return matches
+    c = _matches_cache.get("matches_football")
+    if c: return c
+    m = await fetch_api_football_matches()
+    if not m: m = await fetch_footballdata_matches()      # fallback на footballdata.io
+    _matches_cache.set("matches_football", m); return m
 
 async def fetch_pandascore_matches():
     if not PANDASCORE_API_KEY: return []
-    cached = _matches_cache.get("matches_esports")
-    if cached: return cached
-    matches = []
-    headers = {"Authorization": f"Bearer {PANDASCORE_API_KEY}", "Accept": "application/json"}
-    for game_code in ['cs2', 'dota2', 'lol', 'valorant']:
-        data = await fetch_json_with_retry(f"https://api.pandascore.co/{game_code}/matches/upcoming", headers=headers, params={"page[size]": 20, "sort": "begin_at"})
+    c = _matches_cache.get("matches_esports")
+    if c: return c
+    out, headers = [], {"Authorization": f"Bearer {PANDASCORE_API_KEY}", "Accept": "application/json"}
+    for g in ['cs2','dota2','lol','valorant']:
+        data = await fetch_json_with_retry(f"https://api.pandascore.co/{g}/matches/upcoming", headers=headers, params={"page[size]": 20, "sort": "begin_at"})
         if data:
             for m in data:
-                if len(m.get('opponents', [])) >= 2:
-                    t1 = m['opponents'][0].get('opponent', {}).get('name', 'Unknown')
-                    t2 = m['opponents'][1].get('opponent', {}).get('name', 'Unknown')
+                if len(m.get('opponents',[])) >= 2:
+                    t1 = m['opponents'][0].get('opponent',{}).get('name','Unknown'); t2 = m['opponents'][1].get('opponent',{}).get('name','Unknown')
                     if t1 != 'Unknown' and t2 != 'Unknown':
-                        match_format = m.get('series', {}).get('type', 3)
-                        matches.append({"id": f"ps_{m['id']}", "team1": t1, "team2": t2, "date": m.get('begin_at', ''), "sport": "esports", "tournament": m.get('league', {}).get('name', 'Unknown'), "format": match_format})
-    _matches_cache.set("matches_esports", matches)
-    return matches
+                        fmt = m.get('series',{}).get('type') or 1
+                        out.append({"id": f"ps_{m['id']}", "team1": t1, "team2": t2, "date": m.get('begin_at',''), "sport": "esports", "tournament": m.get('league',{}).get('name','Unknown'), "format": fmt})
+    _matches_cache.set("matches_esports", out); return out
 
 async def fetch_api_sport_hockey_matches():
-    """Сбор хоккейных матчей напрямую из API-Sport (Hockey)"""
-    hockey_api_key = os.getenv("HOCKEY_API_SPORTS", "")
-    if not hockey_api_key: 
-        logger.warning("HOCKEY_API_SPORTS не задан в окружении. Использую мок-данные.")
-        return []
-    
-    url = "https://v1.hockey.api-sports.io/games"
-    headers = {"x-apisports-key": hockey_api_key}
-    params = {"date": datetime.now().strftime("%Y-%m-%d")}
-    
-    data = await fetch_json_with_retry(url, headers=headers, params=params)
-    matches = []
+    if not HOCKEY_API_SPORTS: return []
+    data = await fetch_json_with_retry("https://v1.hockey.api-sports.io/games", headers={"x-apisports-key": HOCKEY_API_SPORTS}, params={"date": datetime.now().strftime("%Y-%m-%d")})
+    out = []
     if data and data.get('response'):
         for g in data['response']:
             try:
-                team1 = g.get('teams', {}).get('home', {}).get('name')
-                team2 = g.get('teams', {}).get('away', {}).get('name')
-                if not team1 or not team2: continue
-                
-                game_date = g.get('game', {}).get('date')
-                if isinstance(game_date, dict):
-                    game_date = game_date.get('start', '')
-                elif not game_date:
-                    game_date = ''
-                
-                matches.append({
-                    "id": f"hk_{g['game']['id']}",
-                    "team1": team1,
-                    "team2": team2,
-                    "date": game_date,
-                    "sport": "hockey",
-                    "tournament": g.get('league', {}).get('name', 'Hockey')
-                })
-            except Exception:
-                continue
-    elif data and data.get('errors'):
-        logger.error(f"Ошибка API-Sport Hockey: {data.get('errors')}")
-    return matches
+                t1 = g.get('teams',{}).get('home',{}).get('name'); t2 = g.get('teams',{}).get('away',{}).get('name')
+                if not t1 or not t2: continue
+                gd = g.get('game',{}).get('date'); gd = gd.get('start','') if isinstance(gd, dict) else (gd or '')
+                out.append({"id": f"hk_{g['game']['id']}", "team1": t1, "team2": t2, "date": gd, "sport": "hockey", "tournament": g.get('league',{}).get('name','Hockey')})
+            except Exception: continue
+    elif data and data.get('errors'): logger.error(f"Hockey API error: {data.get('errors')}")
+    return out
 
 async def fetch_hockey_matches():
-    cache_key = "matches_hockey"
-    cached = _matches_cache.get(cache_key)
-    if cached: return cached
-    real_matches = await fetch_api_sport_hockey_matches()
-    if real_matches:
-        _matches_cache.set(cache_key, real_matches)
-        return real_matches
+    c = _matches_cache.get("matches_hockey")
+    if c: return c
+    real = await fetch_api_sport_hockey_matches()
+    if real: _matches_cache.set("matches_hockey", real); return real
     return [{"id": "hk_301", "team1": "ЦСКА", "team2": "СКА", "date": datetime.now().strftime("%Y-%m-%d"), "sport": "hockey", "tournament": "КХЛ", "is_mock_source": True}]
+
+async def fetch_basketball_matches():
+    if not BASKETBALL_API_KEY: return []
+    c = _matches_cache.get("matches_basketball")
+    if c: return c
+    data = await fetch_json_with_retry("https://v1.basketball.api-sports.io/games", headers={"x-apisports-key": BASKETBALL_API_KEY}, params={"date": datetime.now().strftime("%Y-%m-%d")})
+    out = []
+    if data and data.get('response'):
+        for g in data['response']:
+            try:
+                t1 = g.get('teams',{}).get('home',{}).get('name'); t2 = g.get('teams',{}).get('away',{}).get('name')
+                if not t1 or not t2: continue
+                out.append({"id": f"bk_{g['game']['id']}", "team1": t1, "team2": t2, "date": g.get('game',{}).get('date',''), "sport": "basketball", "tournament": g.get('league',{}).get('name','Basketball')})
+            except Exception: continue
+    _matches_cache.set("matches_basketball", out); return out
+
+async def fetch_mma_matches():
+    if not MMA_API_KEY: return []
+    c = _matches_cache.get("matches_mma")
+    if c: return c
+    data = await fetch_json_with_retry("https://v1.mma.api-sports.io/fights", headers={"x-apisports-key": MMA_API_KEY}, params={"date": datetime.now().strftime("%Y-%m-%d")})
+    out = []
+    if data and data.get('response'):
+        for f in data['response']:
+            try:
+                t1 = f.get('teams',{}).get('home',{}).get('name'); t2 = f.get('teams',{}).get('away',{}).get('name')
+                if not t1 or not t2: continue
+                out.append({"id": f"mma_{f['fight']['id']}", "team1": t1, "team2": t2, "date": f.get('fight',{}).get('date',''), "sport": "mma", "tournament": f.get('league',{}).get('name','MMA/Boxing')})
+            except Exception: continue
+    _matches_cache.set("matches_mma", out); return out
 
 async def fetch_live_football_matches():
     if not FOOTBALL_API_KEY: return []
-    cached = _live_cache.get("live_football")
-    if cached: return cached
+    c = _live_cache.get("live_football")
+    if c: return c
     data = await fetch_json_with_retry("https://v3.football.api-sports.io/fixtures", headers={"x-apisports-key": FOOTBALL_API_KEY}, params={"live": "all"})
-    live_matches = []
+    out = []
     if data:
         for f in data.get('response', []):
-            if f.get('league', {}).get('id') in POPULAR_LIVE_LEAGUES:
+            if f.get('league',{}).get('id') in POPULAR_LIVE_LEAGUES:
                 try:
-                    team1 = f.get('teams', {}).get('home', {}).get('name')
-                    team2 = f.get('teams', {}).get('away', {}).get('name')
-                    if not team1 or not team2: continue
-                    live_matches.append({
-                        "id": f"af_{f['fixture']['id']}", "team1": team1, "team2": team2, 
-                        "score1": f.get('goals', {}).get('home') or 0, 
-                        "score2": f.get('goals', {}).get('away') or 0, 
-                        "minute": f.get('fixture', {}).get('status', {}).get('elapsed') or 0, 
-                        "tournament": f.get('league', {}).get('name', 'Unknown'), "sport": "football"
-                    })
-                except Exception:
-                    continue
-    limit = int(os.getenv("MAX_LIVE_FOOTBALL", 2))
-    live_matches = live_matches[:limit]
-    _live_cache.set("live_football", live_matches)
-    return live_matches
+                    t1 = f.get('teams',{}).get('home',{}).get('name'); t2 = f.get('teams',{}).get('away',{}).get('name')
+                    if not t1 or not t2: continue
+                    out.append({"id": f"af_{f['fixture']['id']}", "team1": t1, "team2": t2,
+                                "score1": f.get('goals',{}).get('home') or 0, "score2": f.get('goals',{}).get('away') or 0,
+                                "minute": f.get('fixture',{}).get('status',{}).get('elapsed') or 0,
+                                "tournament": f.get('league',{}).get('name','Unknown'), "sport": "football"})
+                except Exception: continue
+    out = out[:MAX_LIVE_FOOTBALL]; _live_cache.set("live_football", out); return out
 
 async def fetch_live_esports_matches():
     if not PANDASCORE_API_KEY: return []
-    cached = _live_cache.get("live_esports")
-    if cached: return cached
+    c = _live_cache.get("live_esports")
+    if c: return c
     data = await fetch_json_with_retry("https://api.pandascore.co/matches/running", headers={"Authorization": f"Bearer {PANDASCORE_API_KEY}", "Accept": "application/json"})
-    live_matches = []
+    out = []
     if data:
         for m in data:
-            if len(m.get('opponents', [])) >= 2:
-                t1 = m['opponents'][0].get('opponent', {}).get('name', 'T1')
-                t2 = m['opponents'][1].get('opponent', {}).get('name', 'T2')
-                results = m.get('results', [])
-                s1 = next((r['score'] for r in results if r.get('team_id') == m['opponents'][0]['opponent'].get('id')), 0)
-                s2 = next((r['score'] for r in results if r.get('team_id') == m['opponents'][1]['opponent'].get('id')), 0)
-                live_matches.append({"id": f"ps_{m['id']}", "team1": t1, "team2": t2, "score1": s1, "score2": s2, "tournament": m.get('league', {}).get('name', 'Esports'), "game": m.get('videogame', {}).get('name', 'Game'), "sport": "esports"})
-    live_matches = live_matches[:3]
-    _live_cache.set("live_esports", live_matches)
-    return live_matches
+            if len(m.get('opponents',[])) >= 2:
+                t1 = m['opponents'][0].get('opponent',{}).get('name','T1'); t2 = m['opponents'][1].get('opponent',{}).get('name','T2')
+                res = m.get('results',[])
+                s1 = next((r['score'] for r in res if r.get('team_id')==m['opponents'][0]['opponent'].get('id')), 0)
+                s2 = next((r['score'] for r in res if r.get('team_id')==m['opponents'][1]['opponent'].get('id')), 0)
+                out.append({"id": f"ps_{m['id']}", "team1": t1, "team2": t2, "score1": s1, "score2": s2,
+                            "tournament": m.get('league',{}).get('name','Esports'), "game": m.get('videogame',{}).get('name','Game'), "sport": "esports"})
+    out = out[:MAX_LIVE_ESPORTS]; _live_cache.set("live_esports", out); return out
 
-# ==================== ОБУЧЕНИЕ (LOG-LOSS + XG) ====================
-
-async def update_team_ratings_from_result(sport: str, team1: str, team2: str, score1: int, score2: int):
+# ==================== ОБУЧЕНИЕ И ПРОВЕРКА РЕЗУЛЬТАТОВ ====================
+async def update_team_ratings_from_result(sport, team1, team2, s1, s2):
     db = await get_db()
-    t1 = await get_team_data(team1, sport)
-    t2 = await get_team_data(team2, sport)
-    expected1 = 1 / (1 + 10 ** ((t2['elo_rating'] - t1['elo_rating']) / 400))
-    actual1 = 1.0 if score1 > score2 else (0.0 if score1 < score2 else 0.5)
-    new_elo1 = t1['elo_rating'] + 32 * (actual1 - expected1)
-    new_elo2 = t2['elo_rating'] + 32 * ((1 - actual1) - (1 - expected1))
-    adj_score1 = (score1 + t1['goals_avg']) / 2.0 if score1 > t1['goals_avg'] else score1
-    adj_score2 = (score2 + t2['goals_avg']) / 2.0 if score2 > t2['goals_avg'] else score2
-    new_goals1 = (t1['goals_avg'] * 0.8) + (adj_score1 * 0.2)
-    new_goals2 = (t2['goals_avg'] * 0.8) + (adj_score2 * 0.2)
-    
-    await db.execute("INSERT INTO team_ratings (team_id, sport, elo, strength, goals_avg, form, games_played, goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(team_id) DO UPDATE SET elo=excluded.elo, goals_avg=excluded.goals_avg, form=excluded.form, games_played=excluded.games_played, updated_at=excluded.updated_at", 
-                     (f"{sport}_{team1}", sport, new_elo1, t1['strength'], new_goals1, (t1['form']*0.7 + (100 if actual1==1 else 50 if actual1==0.5 else 0)*0.3), t1['games_played']+1, t1['goals_scored_home'], t1['goals_scored_away'], t1['goals_conceded_home'], t1['goals_conceded_away']))
-    await db.execute("INSERT INTO team_ratings (team_id, sport, elo, strength, goals_avg, form, games_played, goals_scored_home, goals_scored_away, goals_conceded_home, goals_conceded_away, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(team_id) DO UPDATE SET elo=excluded.elo, goals_avg=excluded.goals_avg, form=excluded.form, games_played=excluded.games_played, updated_at=excluded.updated_at", 
-                     (f"{sport}_{team2}", sport, new_elo2, t2['strength'], new_goals2, (t2['form']*0.7 + (100 if actual1==0 else 50 if actual1==0.5 else 0)*0.3), t2['games_played']+1, t2['goals_scored_home'], t2['goals_scored_away'], t2['goals_conceded_home'], t2['goals_conceded_away']))
+    t1, t2 = await get_team_data(team1, sport), await get_team_data(team2, sport)
+    exp1 = 1 / (1 + 10 ** ((t2['elo_rating']-t1['elo_rating'])/400))
+    act1 = 1.0 if s1 > s2 else (0.0 if s1 < s2 else 0.5)
+    e1 = t1['elo_rating'] + 32*(act1-exp1); e2 = t2['elo_rating'] + 32*((1-act1)-(1-exp1))
+    a1 = (s1+t1['goals_avg'])/2.0 if s1 > t1['goals_avg'] else s1
+    a2 = (s2+t2['goals_avg'])/2.0 if s2 > t2['goals_avg'] else s2
+    g1 = t1['goals_avg']*0.8 + a1*0.2; g2 = t2['goals_avg']*0.8 + a2*0.2
+    f1 = t1['form']*0.7 + (100 if act1==1 else 50 if act1==0.5 else 0)*0.3
+    f2 = t2['form']*0.7 + (100 if act1==0 else 50 if act1==0.5 else 0)*0.3
+    sql = ("INSERT INTO team_ratings (team_id, sport, elo, strength, goals_avg, form, games_played, goals_scored_home, "
+           "goals_scored_away, goals_conceded_home, goals_conceded_away, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime('now')) "
+           "ON CONFLICT(team_id) DO UPDATE SET elo=excluded.elo, goals_avg=excluded.goals_avg, form=excluded.form, "
+           "games_played=excluded.games_played, updated_at=excluded.updated_at")
+    await db.execute(sql, (f"{sport}_{team1}", sport, e1, t1['strength'], g1, f1, t1['games_played']+1, t1['goals_scored_home'], t1['goals_scored_away'], t1['goals_conceded_home'], t1['goals_conceded_away']))
+    await db.execute(sql, (f"{sport}_{team2}", sport, e2, t2['strength'], g2, f2, t2['games_played']+1, t2['goals_scored_home'], t2['goals_scored_away'], t2['goals_conceded_home'], t2['goals_conceded_away']))
     await db.commit()
 
-async def record_component_scores(match_id: str, components: dict, actual_result: str):
+async def record_component_scores(match_id, components, actual_result):
     if not components: return
     db = await get_db()
-    actual_vec = {'home_win': (1.0, 0.0, 0.0), 'draw': (0.0, 1.0, 0.0), 'away_win': (0.0, 0.0, 1.0)}.get(actual_result)
-    if not actual_vec: return
+    vec = {'home_win': (1,0,0), 'draw': (0,1,0), 'away_win': (0,0,1)}.get(actual_result)
+    if not vec: return
     for name, comp in components.items():
         if not comp: continue
-        p_vec = (max(1e-5, comp.get('p1', 0) / 100), max(1e-5, comp.get('x', 0) / 100), max(1e-5, comp.get('p2', 0) / 100))
-        log_loss = -sum(a * math.log(p) for p, a in zip(p_vec, actual_vec))
-        await db.execute("INSERT INTO model_component_scores (match_id, component, brier, checked_at) VALUES (?, ?, ?, datetime('now'))", (match_id, name, log_loss))
+        pv = (max(1e-5, comp.get('p1',0)/100), max(1e-5, comp.get('x',0)/100), max(1e-5, comp.get('p2',0)/100))
+        ll = -sum(a*math.log(p) for p, a in zip(pv, vec))
+        await db.execute("INSERT INTO model_component_scores (match_id, component, brier, checked_at) VALUES (?, ?, ?, datetime('now'))", (match_id, name, ll))
     await db.commit()
 
 async def analyze_prediction_accuracy(match_id, actual_result):
     db = await get_db()
-    async with db.execute("SELECT user_id, recommendation, confidence, probabilities FROM predictions WHERE match_id = ?", (match_id,)) as cursor:
-        predictions = await cursor.fetchall()
-    for pred in predictions:
-        user_id, recommendation, confidence, probs_json = pred
-        is_correct = 0
-        if actual_result == 'home_win' and 'П1' in recommendation: is_correct = 1
-        elif actual_result == 'away_win' and 'П2' in recommendation: is_correct = 1
-        elif actual_result == 'draw' and ('Ничья' in recommendation or 'X' in recommendation): is_correct = 1
-        await db.execute("INSERT INTO prediction_results (match_id, user_id, prediction, actual_result, is_correct, confidence) VALUES (?, ?, ?, ?, ?, ?)", (match_id, user_id, recommendation, actual_result, is_correct, confidence))
-    
-    async with db.execute("SELECT id, user_id, bet_amount, odds, prediction FROM virtual_bets WHERE match_id = ? AND status = 0", (match_id,)) as cursor:
-        v_bets = await cursor.fetchall()
-    for vb in v_bets:
-        bet_id, v_user_id, amount, odds, pred = vb[0], vb[1], vb[2], vb[3], vb[4]
-        won = (actual_result == 'home_win' and 'П1' in pred) or (actual_result == 'away_win' and 'П2' in pred) or (actual_result == 'draw' and 'Ничья' in pred)
+    async with db.execute("SELECT user_id, recommendation, confidence, probabilities FROM predictions WHERE match_id = ?", (match_id,)) as c:
+        preds = await c.fetchall()
+    for p in preds:
+        uid, rec, conf, _ = p
+        ok = (actual_result=='home_win' and 'П1' in rec) or (actual_result=='away_win' and 'П2' in rec) or (actual_result=='draw' and ('Ничья' in rec or 'X' in rec))
+        await db.execute("INSERT INTO prediction_results (match_id, user_id, prediction, actual_result, is_correct, confidence) VALUES (?,?,?,?,?,?)", (match_id, uid, rec, actual_result, 1 if ok else 0, conf))
+    async with db.execute("SELECT id, user_id, bet_amount, odds, prediction FROM virtual_bets WHERE match_id = ? AND status = 0", (match_id,)) as c:
+        vbs = await c.fetchall()
+    for vb in vbs:
+        bid, vuid, amt, odds, pred = vb[0], vb[1], vb[2], vb[3], vb[4]
+        won = (actual_result=='home_win' and 'П1' in pred) or (actual_result=='away_win' and 'П2' in pred) or (actual_result=='draw' and 'Ничья' in pred)
         if won:
-            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount * odds, v_user_id))
-            await db.execute("UPDATE virtual_bets SET status = 1 WHERE id = ?", (bet_id,))
+            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amt*odds, vuid))
+            await db.execute("UPDATE virtual_bets SET status = 1 WHERE id = ?", (bid,))
         else:
-            await db.execute("UPDATE virtual_bets SET status = 2 WHERE id = ?", (bet_id,))
+            await db.execute("UPDATE virtual_bets SET status = 2 WHERE id = ?", (bid,))
     await db.commit()
-    if predictions:
+    if preds:
         try:
-            first_probs = json.loads(predictions[0][3])
-            components = first_probs.get('components')
-            if components: await record_component_scores(match_id, components, actual_result)
-        except: pass
+            comp = json.loads(preds[0][3]).get('components')
+            if comp: await record_component_scores(match_id, comp, actual_result)
+        except Exception: pass
 
-async def get_current_weights() -> dict | None:
+async def get_current_weights():
     db = await get_db()
-    async with db.execute("SELECT component, weight FROM model_weights") as cursor:
-        rows = await cursor.fetchall()
+    async with db.execute("SELECT component, weight FROM model_weights") as c: rows = await c.fetchall()
     if not rows: return None
-    weights = {row[0]: row[1] for row in rows}
-    required = set(DEFAULT_ENSEMBLE_WEIGHTS.keys())
-    if not required.issubset(weights.keys()): return None
-    total = sum(weights.values())
-    if total <= 0: return None
-    return {k: weights[k] / total for k in required}
+    w = {r[0]: r[1] for r in rows}
+    if not set(DEFAULT_ENSEMBLE_WEIGHTS).issubset(w): return None
+    t = sum(w.values())
+    return {k: w[k]/t for k in DEFAULT_ENSEMBLE_WEIGHTS} if t > 0 else None
 
 async def compute_adaptive_weights():
     db = await get_db()
-    async with db.execute("SELECT component, AVG(brier) as avg_loss, COUNT(*) as n FROM model_component_scores GROUP BY component") as cursor:
-        rows = await cursor.fetchall()
-    if not rows: return
-    if sum(r[2] for r in rows) < 30: return
-    eps = 1e-5
-    raw_weights = {r[0]: math.exp(-3.0 * (r[1] + eps)) for r in rows}
-    total = sum(raw_weights.values())
-    normalized = {k: round(v / total, 4) for k, v in raw_weights.items()}
-    for component, weight in normalized.items():
-        await db.execute("INSERT INTO model_weights (component, weight, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(component) DO UPDATE SET weight=excluded.weight, updated_at=excluded.updated_at", (component, weight))
+    async with db.execute("SELECT component, AVG(brier) AS loss, COUNT(*) AS n FROM model_component_scores GROUP BY component") as c: rows = await c.fetchall()
+    if not rows or sum(r[2] for r in rows) < ADAPT_MIN_SAMPLES: return
+    raw = {r[0]: math.exp(-3.0*(r[1]+1e-5)) for r in rows}; t = sum(raw.values())
+    norm = {k: round(v/t, 4) for k, v in raw.items()}
+    for comp, wt in norm.items():
+        await db.execute("INSERT INTO model_weights (component, weight, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(component) DO UPDATE SET weight=excluded.weight, updated_at=excluded.updated_at", (comp, wt))
     await db.commit()
 
-async def _check_af_result(fixture_id: str):
-    data = await fetch_json_with_retry("https://v3.football.api-sports.io/fixtures", headers={"x-apisports-key": FOOTBALL_API_KEY}, params={"id": fixture_id})
+async def _check_af_result(fid):
+    data = await fetch_json_with_retry("https://v3.football.api-sports.io/fixtures", headers={"x-apisports-key": FOOTBALL_API_KEY}, params={"id": fid})
     if data:
         for f in data.get('response', []):
-            if f.get('fixture', {}).get('status', {}).get('short') in ('FT', 'AET', 'PEN'):
-                goals = f.get('goals', {})
-                if goals.get('home') is not None and goals.get('away') is not None: return goals['home'], goals['away']
+            if f.get('fixture',{}).get('status',{}).get('short') in ('FT','AET','PEN'):
+                g = f.get('goals',{})
+                if g.get('home') is not None and g.get('away') is not None: return g['home'], g['away']
     return None
 
-async def _check_ps_result(match_numeric_id: str):
-    data = await fetch_json_with_retry(f"https://api.pandascore.co/matches/{match_numeric_id}", headers={"Authorization": f"Bearer {PANDASCORE_API_KEY}", "Accept": "application/json"})
+async def _check_fd_result(mid):
+    data = await fetch_json_with_retry(f"https://api.football-data.org/v4/matches/{mid}", headers={"X-Auth-Token": FOOTBALLDATA_KEY})
+    if data and data.get('status') == 'FINISHED':
+        ft = data.get('score',{}).get('fullTime',{})
+        if ft.get('home') is not None and ft.get('away') is not None: return ft['home'], ft['away']
+    return None
+
+async def _check_ps_result(mid):
+    data = await fetch_json_with_retry(f"https://api.pandascore.co/matches/{mid}", headers={"Authorization": f"Bearer {PANDASCORE_API_KEY}", "Accept": "application/json"})
     if data and data.get('status') == 'finished':
-        results = data.get('results', [])
-        opponents = data.get('opponents', [])
-        if len(results) >= 2 and len(opponents) >= 2:
-            id1 = opponents[0].get('opponent', {}).get('id')
-            id2 = opponents[1].get('opponent', {}).get('id')
-            score_by_id = {r.get('team_id'): r.get('score') for r in results}
-            if id1 in score_by_id and id2 in score_by_id: return score_by_id[id1], score_by_id[id2]
+        res, opp = data.get('results',[]), data.get('opponents',[])
+        if len(res) >= 2 and len(opp) >= 2:
+            i1, i2 = opp[0].get('opponent',{}).get('id'), opp[1].get('opponent',{}).get('id')
+            sb = {r.get('team_id'): r.get('score') for r in res}
+            if i1 in sb and i2 in sb: return sb[i1], sb[i2]
+    return None
+
+async def _check_hk_result(gid):
+    data = await fetch_json_with_retry("https://v1.hockey.api-sports.io/games", headers={"x-apisports-key": HOCKEY_API_SPORTS}, params={"id": gid})
+    if data and data.get('response'):
+        g = data['response'][0]
+        st = g.get('game',{}).get('status',{}) or g.get('status',{})
+        if st.get('short') in ('FT','AOT','OT','SO','Ended','Finished'):
+            sc = g.get('scores',{}); h = sc.get('home',{}).get('total'); a = sc.get('away',{}).get('total')
+            if h is not None and a is not None: return h, a
+    return None
+
+async def _check_bk_result(gid):
+    data = await fetch_json_with_retry("https://v1.basketball.api-sports.io/games", headers={"x-apisports-key": BASKETBALL_API_KEY}, params={"id": gid})
+    if data and data.get('response'):
+        g = data['response'][0]
+        st = g.get('game',{}).get('status',{}) or g.get('status',{})
+        if st.get('short') in ('FT','AOT','OT','AP','Ended','Finished'):
+            sc = g.get('scores',{}); h = sc.get('home',{}).get('total'); a = sc.get('away',{}).get('total')
+            if h is not None and a is not None: return h, a
+    return None
+
+async def _check_mma_result(fid):
+    data = await fetch_json_with_retry("https://v1.mma.api-sports.io/fights", headers={"x-apisports-key": MMA_API_KEY}, params={"id": fid})
+    if not data or not data.get('response'): return None
+    f = data['response'][0]
+    st = f.get('fight',{}).get('status',{}) or f.get('status',{})
+    if st.get('short') not in ('FT','Ended','Result','Decided','Draw','NC'): return None
+    if st.get('short') in ('Draw','NC'): return (0, 0)
+    w = f.get('fight',{}).get('winner') or f.get('winner')
+    if w in ('home','Home'): return (1, 0)
+    if w in ('away','Away'): return (0, 1)
+    th, ta = f.get('teams',{}).get('home',{}), f.get('teams',{}).get('away',{})
+    if th.get('winner') is True: return (1, 0)
+    if ta.get('winner') is True: return (0, 1)
+    sc = f.get('scores',{})
+    if sc.get('home') is not None and sc.get('away') is not None: return sc['home'], sc['away']
     return None
 
 async def check_and_update_finished_matches():
     db = await get_db()
-    async with db.execute("SELECT match_id, sport, team1, team2, match_date FROM matches WHERE is_finished = 0 AND match_date < datetime('now', '-3 hours') AND match_date != ''") as cursor:
-        matches = await cursor.fetchall()
-    checkers = {'af_': _check_af_result, 'ps_': _check_ps_result}
-    for match in matches:
-        match_id, sport, team1, team2, match_date = match[0], match[1], match[2], match[3], match[4]
-        prefix = next((p for p in checkers if match_id.startswith(p)), None)
-        if prefix is None: continue
-        result = await checkers[prefix](match_id[len(prefix):])
-        if not result: continue
-        home, away = result
-        await db.execute("UPDATE matches SET team1_score = ?, team2_score = ?, is_finished = 1 WHERE match_id = ?", (home, away, match_id))
-        await update_team_ratings_from_result(sport, team1, team2, home, away)
-        actual_result = 'home_win' if home > away else ('away_win' if home < away else 'draw')
-        await analyze_prediction_accuracy(match_id, actual_result)
+    async with db.execute("SELECT match_id, sport, team1, team2, match_date FROM matches WHERE is_finished = 0 AND match_date < datetime('now', '-3 hours') AND match_date != ''") as c:
+        matches = await c.fetchall()
+    checkers = {'af_': _check_af_result, 'fd_': _check_fd_result, 'ps_': _check_ps_result,
+                'hk_': _check_hk_result, 'bk_': _check_bk_result, 'mma_': _check_mma_result}
+    for m in matches:
+        mid, sport, t1, t2 = m[0], m[1], m[2], m[3]
+        pref = next((p for p in checkers if mid.startswith(p)), None)
+        if not pref: continue
+        res = await checkers[pref](mid[len(pref):])
+        if not res: continue
+        h, a = res
+        await db.execute("UPDATE matches SET team1_score = ?, team2_score = ?, is_finished = 1 WHERE match_id = ?", (h, a, mid))
+        await update_team_ratings_from_result(sport, t1, t2, h, a)
+        await analyze_prediction_accuracy(mid, 'home_win' if h > a else ('away_win' if h < a else 'draw'))
     await db.commit()
 
 async def backfill_football_history():
     db = await get_db()
-    async with db.execute("SELECT value FROM bootstrap_state WHERE key = 'football_backfill_done'") as cursor:
-        if await cursor.fetchone(): return 0
-    total_processed = 0
-    current_season = datetime.now().year
-    for league_code, league_name in OPENLIGADB_LEAGUES:
-        for season in [current_season, current_season - 1]:
-            data = await fetch_json_with_retry(f"https://www.openligadb.de/api/getmatchdata/{league_code}/{season}")
+    async with db.execute("SELECT value FROM bootstrap_state WHERE key = 'football_backfill_done'") as c:
+        if await c.fetchone(): return 0
+    total, year = 0, datetime.now().year
+    for code, _ in OPENLIGADB_LEAGUES:
+        for season in [year, year-1]:
+            data = await fetch_json_with_retry(f"https://www.openligadb.de/api/getmatchdata/{code}/{season}")
             if not data: continue
-            finished = [m for m in data if m.get('MatchIsFinished')]
-            finished.sort(key=lambda m: m.get('MatchDateTime', ''))
-            for m in finished:
-                results = m.get('MatchResults', [])
-                if not results: continue
-                final = results[-1]
-                home, away = final.get('PointsTeam1'), final.get('PointsTeam2')
-                if home is None or away is None: continue
-                team1 = m.get('Team1', {}).get('TeamName')
-                team2 = m.get('Team2', {}).get('TeamName')
-                if team1 and team2:
-                    await update_team_ratings_from_result('football', team1, team2, home, away)
-                    total_processed += 1
+            for m in sorted([x for x in data if x.get('MatchIsFinished')], key=lambda x: x.get('MatchDateTime','')):
+                r = m.get('MatchResults', [])
+                if not r: continue
+                h, a = r[-1].get('PointsTeam1'), r[-1].get('PointsTeam2')
+                t1, t2 = m.get('Team1',{}).get('TeamName'), m.get('Team2',{}).get('TeamName')
+                if h is None or a is None or not t1 or not t2: continue
+                await update_team_ratings_from_result('football', t1, t2, h, a); total += 1
             await asyncio.sleep(1)
-    await db.execute("INSERT INTO bootstrap_state (key, value, updated_at) VALUES ('football_backfill_done', '1', datetime('now')) ON CONFLICT(key) DO UPDATE SET value='1', updated_at=datetime('now')")
-    await db.commit()
-    return total_processed
-    # Часть 3: Анализаторы, Пагинация матчей, Динамический Келли, UI, Безопасная рассылка
+    await db.execute("INSERT INTO bootstrap_state (key, value, updated_at) VALUES ('football_backfill_done','1',datetime('now')) ON CONFLICT(key) DO UPDATE SET value='1', updated_at=datetime('now')")
+    await db.commit(); return total
+    # ==================== (импорт для безопасного HTML — имена команд/турниров) ====================
+from html import escape as _html_escape
+def _esc(s): return _html_escape(str(s or ""), quote=False)
 
 # ==================== АНАЛИЗАТОРЫ ====================
-
 async def analyze_live_football_match(match):
-    t1 = await get_team_data(match['team1'], 'football')
-    t2 = await get_team_data(match['team2'], 'football')
-    lambda1 = (t1['goals_scored_home'] + t2['goals_conceded_away']) / 2
-    lambda2 = (t2['goals_scored_away'] + t1['goals_conceded_home']) / 2
-    p_win, p_draw, p_loss, p_over = LivePoissonModel.calculate_live_probabilities(lambda1, lambda2, match['score1'], match['score2'], match['minute'])
-    situation = "Игра идет предсказуемо."
-    if match['minute'] > 75 and match['score1'] == match['score2']: situation = "Ничья на последних минутах. Рассмотрите ТМ."
-    elif match['score1'] < match['score2'] and t1['strength'] > t2['strength']: situation = "Фаворит проигрывает. Ожидается прессинг. Рассмотрите П1 или ТБ."
-    return (f"🔴 <b>LIVE: {match['team1']} {match['score1']}:{match['score2']} {match['team2']}</b> ({match['minute']}')\n"
-            f"🏆 <b>Турнир:</b> {match['tournament']}\n\n📊 <b>Пересчет:</b>\n• П1: {p_win}% | X: {p_draw}% | П2: {p_loss}%\n• ТБ 2.5: {p_over}%\n\n💡 <b>Ситуация:</b>\n{situation}\n")
+    t1 = await get_team_data(match['team1'], 'football'); t2 = await get_team_data(match['team2'], 'football')
+    l1 = (t1['goals_scored_home'] + t2['goals_conceded_away']) / 2
+    l2 = (t2['goals_scored_away'] + t1['goals_conceded_home']) / 2
+    pw, pd, pl, po = LivePoissonModel.calculate_live_probabilities(l1, l2, match['score1'], match['score2'], match['minute'])
+    sit = "Игра идет предсказуемо."
+    if match['minute'] > 75 and match['score1'] == match['score2']: sit = "Ничья на последних минутах. Рассмотрите ТМ."
+    elif match['score1'] < match['score2'] and t1['strength'] > t2['strength']: sit = "Фаворит проигрывает. Ожидается прессинг. Рассмотрите П1 или ТБ."
+    return (f"🔴 <b>LIVE: {_esc(match['team1'])} {match['score1']}:{match['score2']} {_esc(match['team2'])}</b> ({match['minute']}')\n"
+            f"🏆 <b>Турнир:</b> {_esc(match['tournament'])}\n\n📊 <b>Пересчет:</b>\n• П1: {pw}% | X: {pd}% | П2: {pl}%\n• ТБ 2.5: {po}%\n\n💡 <b>Ситуация:</b>\n{sit}\n")
 
 async def analyze_live_esports_match(match):
-    t1 = await get_team_data(match['team1'], 'esports')
-    t2 = await get_team_data(match['team2'], 'esports')
-    predictor = EnsemblePredictor()
-    result = predictor.predict(t1, t2, sport='esports')
-    p1_live = max(5, min(95, result['p1'] + (match['score1'] - match['score2']) * 15))
-    p2_live = 100 - p1_live
-    situation = "Серия идет предсказуемо."
-    if match['score2'] > match['score1'] and result['p1'] > result['p2']: situation = "Фаворит проигрывает в серии. Отличный шанс зайти на высокий кэф."
-    return (f"🔴 <b>LIVE: {match['team1']} {match['score1']}:{match['score2']} {match['team2']}</b>\n"
-            f"🎮 <b>Игра:</b> {match['game']} | <b>Турнир:</b> {match['tournament']}\n\n📊 <b>Оценка:</b>\n• До: П1={result['p1']}% | П2={result['p2']}%\n• В лайве: П1={p1_live}% | П2={p2_live}%\n\n💡 <b>Ситуация:</b>\n{situation}\n")
+    t1 = await get_team_data(match['team1'], 'esports'); t2 = await get_team_data(match['team2'], 'esports')
+    r = EnsemblePredictor().predict(t1, t2, sport='esports')
+    p1l = max(5, min(95, r['p1'] + (match['score1'] - match['score2']) * 15)); p2l = 100 - p1l
+    sit = "Серия идет предсказуемо."
+    if match['score2'] > match['score1'] and r['p1'] > r['p2']: sit = "Фаворит проигрывает в серии. Шанс зайти на высокий кэф."
+    return (f"🔴 <b>LIVE: {_esc(match['team1'])} {match['score1']}:{match['score2']} {_esc(match['team2'])}</b>\n"
+            f"🎮 <b>Игра:</b> {_esc(match.get('game','Game'))} | <b>Турнир:</b> {_esc(match['tournament'])}\n\n📊 <b>Оценка:</b>\n• До: П1={r['p1']}% | П2={r['p2']}%\n• В лайве: П1={p1l}% | П2={p2l}%\n\n💡 <b>Ситуация:</b>\n{sit}\n")
 
 async def analyze_match(match):
     sport = match.get('sport', 'football')
-    t1 = await get_team_data(match['team1'], sport)
-    t2 = await get_team_data(match['team2'], sport)
-    
-    t1_home_ratio = t1['goals_scored_home'] / max(0.1, t1['goals_scored_away']) if t1['goals_scored_away'] > 0 else 1.2
-    t1_home_factor = max(1.0, min(1.30, 0.5 + t1_home_ratio * 0.5))
-    lambda1 = round(((t1['goals_scored_home'] + t2['goals_conceded_away']) / 2) * t1_home_factor, 2)
-    lambda2 = round(((t2['goals_scored_away'] + t1['goals_conceded_home']) / 2) * 0.95, 2)
-    
-    t1_data = {'goals_avg': lambda1, 'strength': t1['strength'] + round((t1_home_factor - 1.0) * 50, 0), 'form': t1['form'], 'elo_rating': t1['elo_rating']}
-    t2_data = {'goals_avg': lambda2, 'strength': t2['strength'], 'form': t2['form'], 'elo_rating': t2['elo_rating']}
-    
+    t1 = await get_team_data(match['team1'], sport); t2 = await get_team_data(match['team2'], sport)
     bookmaker_odds = await fetch_bookmaker_odds(match['team1'], match['team2'], sport)
-    weights = await get_current_weights()
-    predictor = EnsemblePredictor(weights_override=weights)
-    result = predictor.predict(t1_data, t2_data, sport=sport, bookmaker_odds=bookmaker_odds)
-    
-    best = max(result['p1'], result.get('x', 0), result['p2'])
-    if best == result['p1']: rec, confidence, odds_val = f"П1 ({match['team1']})", result['p1'], bookmaker_odds.get('home', 0)
-    elif best == result['p2']: rec, confidence, odds_val = f"П2 ({match['team2']})", result['p2'], bookmaker_odds.get('away', 0)
-    else: rec, confidence, odds_val = "Ничья (X)", result['x'], bookmaker_odds.get('draw', 0)
+    t1n, t2n, trn = _esc(match['team1']), _esc(match['team2']), _esc(match.get('tournament', ''))
+    raw1, raw2 = match['team1'], match['team2']   # сырые имена — только для промпта ИИ (не HTML)
 
+    # ---------- БАСКЕТБОЛ (двухисходная модель + честные линии тотала/форы) ----------
+    if sport == 'basketball':
+        lambda1 = round((t1['goals_scored_home'] + t2['goals_conceded_away']) / 2, 1)
+        lambda2 = round((t2['goals_scored_away'] + t1['goals_conceded_home']) / 2, 1)
+        p1 = BasketballModel.win_prob(t1, t2); p2 = round(100 - p1, 1)
+        fl = BasketballModel.fair_lines(lambda1 + lambda2, lambda1 - lambda2)
+        method = 'Basketball Model (Elo+Str+Form + Norm lines)'
+        if p1 >= p2:
+            rec, confidence, odds_val, rec_code = f"П1 ({t1n})", p1, bookmaker_odds.get('home', 0), 'P1'
+        else:
+            rec, confidence, odds_val, rec_code = f"П2 ({t2n})", p2, bookmaker_odds.get('away', 0), 'P2'
+        avg_games = (t1['games_played'] + t2['games_played']) / 2
+        kelly = KellyCriterion.calculate_kelly(confidence, odds_val, avg_games) if not bookmaker_odds.get('is_mock') and odds_val > 0 else 0
+        ai_text = await generate_ai_explanation(raw1, raw2, rec, confidence,
+                                                {'form1': t1['form'], 'form2': t2['form'], 'lambda1': lambda1, 'lambda2': lambda2, 'kelly': kelly})
+        drop_text = f"\n🔥 <b>Дроп линии:</b> кэф упал с {bookmaker_odds['old_odds']} до {odds_val} (умные деньги грузят!)\n" if bookmaker_odds.get('is_dropping') and bookmaker_odds.get('old_odds', 0) > 0 else ""
+        lines_text = (f"🏀 <b>Линии модели (тотал/фора):</b>\n"
+                      f"• Ожидаемый тотал очков: ~<b>{fl['mu_total']}</b>\n"
+                      f"• ТБ {fl['over_line']}: {fl['p_over']}% | ТМ {fl['under_line']}: {fl['p_under']}%\n"
+                      f"• Спред в пользу хозяев: {fl['mu_margin']} → покрыть: хозяева {fl['p_cover_home']}% / гости {fl['p_cover_away']}%\n\n")
+        analysis = (f"🏆 <b>{trn}</b>\n📊 П1={p1}% | П2={p2}%  (ничьих в баскетболе нет)\n"
+                    f"📈 Кэф: {odds_val} | Kelly: {kelly}%\n{drop_text}\n{lines_text}{ai_text}\n")
+        return {'analysis': analysis, 'probabilities': {'p1': p1, 'x': 0, 'p2': p2, 'method': method, 'components': None,
+                'odds': odds_val, 'kelly': kelly, 'rec': rec, 'rec_code': rec_code, 'top_score': 'N/A', 'btts': 0, 'lines': fl},
+                'recommendation': rec, 'confidence': confidence, 'bet_type': 'Исход'}
+
+    # ---------- БОКС / ММА (исход боя, без тоталов) ----------
+    if sport == 'mma':
+        p1, x, p2 = MmaModel.predict(t1, t2)
+        method = 'MMA/Boxing Model (Elo+Str+Form)'
+        best = max(p1, x, p2)
+        if best == p1:
+            rec, confidence, odds_val, rec_code = f"П1 ({t1n})", p1, bookmaker_odds.get('home', 0), 'P1'
+        elif best == p2:
+            rec, confidence, odds_val, rec_code = f"П2 ({t2n})", p2, bookmaker_odds.get('away', 0), 'P2'
+        else:
+            rec, confidence, odds_val, rec_code = "Ничья (X)", x, bookmaker_odds.get('draw', 0), 'X'
+        avg_games = (t1['games_played'] + t2['games_played']) / 2
+        kelly = KellyCriterion.calculate_kelly(confidence, odds_val, avg_games) if not bookmaker_odds.get('is_mock') and odds_val > 0 else 0
+        ai_text = await generate_ai_explanation(raw1, raw2, rec, confidence,
+                                                {'form1': t1['form'], 'form2': t2['form'], 'lambda1': t1['strength'], 'lambda2': t2['strength'], 'kelly': kelly})
+        drop_text = f"\n🔥 <b>Дроп линии:</b> кэф упал с {bookmaker_odds['old_odds']} до {odds_val} (умные деньги грузят!)\n" if bookmaker_odds.get('is_dropping') and bookmaker_odds.get('old_odds', 0) > 0 else ""
+        analysis = (f"🏆 <b>{trn}</b>\n🥊 <b>Вероятности исхода боя:</b>\n📊 П1={p1}% | Ничья={x}% | П2={p2}%\n"
+                    f"📈 Кэф: {odds_val} | Kelly: {kelly}%\n{drop_text}\n🧮 <b>Метод:</b> {method}\n\n{ai_text}\n")
+        return {'analysis': analysis, 'probabilities': {'p1': p1, 'x': x, 'p2': p2, 'method': method, 'components': None,
+                'odds': odds_val, 'kelly': kelly, 'rec': rec, 'rec_code': rec_code, 'top_score': 'N/A', 'btts': 0},
+                'recommendation': rec, 'confidence': confidence, 'bet_type': 'Исход'}
+
+    # ---------- ФУТБОЛ / ХОККЕЙ (ансамбль + Монте-Карло) ----------
+    if sport == 'esports':
+        lambda1, lambda2 = round(t1['goals_avg'], 2), round(t2['goals_avg'], 2)
+        t1_data = {'goals_avg': lambda1, 'strength': t1['strength'], 'form': t1['form'], 'elo_rating': t1['elo_rating']}
+        t2_data = {'goals_avg': lambda2, 'strength': t2['strength'], 'form': t2['form'], 'elo_rating': t2['elo_rating']}
+    else:  # football / hockey — преимущество своей площадки
+        ratio = t1['goals_scored_home'] / max(0.1, t1['goals_scored_away']) if t1['goals_scored_away'] > 0 else 1.2
+        home_factor = max(1.0, min(1.30, 0.5 + ratio * 0.5))
+        lambda1 = round(((t1['goals_scored_home'] + t2['goals_conceded_away']) / 2) * home_factor, 2)
+        lambda2 = round(((t2['goals_scored_away'] + t1['goals_conceded_home']) / 2) * 0.95, 2)
+        t1_data = {'goals_avg': lambda1, 'strength': t1['strength'] + round((home_factor - 1.0) * 50, 0), 'form': t1['form'], 'elo_rating': t1['elo_rating']}
+        t2_data = {'goals_avg': lambda2, 'strength': t2['strength'], 'form': t2['form'], 'elo_rating': t2['elo_rating']}
+
+    weights = await get_current_weights()
+    result = EnsemblePredictor(weights_override=weights).predict(t1_data, t2_data, sport=sport, bookmaker_odds=bookmaker_odds)
+    mc = result.get('mc') or {}; top_score = mc.get('top_score', '1:1')
+    best = max(result['p1'], result.get('x', 0), result['p2'])
+    if best == result['p1']:
+        rec, confidence, odds_val, rec_code = f"П1 ({t1n})", result['p1'], bookmaker_odds.get('home', 0), 'P1'
+    elif best == result['p2']:
+        rec, confidence, odds_val, rec_code = f"П2 ({t2n})", result['p2'], bookmaker_odds.get('away', 0), 'P2'
+    else:
+        rec, confidence, odds_val, rec_code = "Ничья (X)", result['x'], bookmaker_odds.get('draw', 0), 'X'
     avg_games = (t1['games_played'] + t2['games_played']) / 2
     kelly = KellyCriterion.calculate_kelly(confidence, odds_val, avg_games) if not bookmaker_odds.get('is_mock') and odds_val > 0 else 0
-    
-    stats_for_ai = {'form1': t1['form'], 'form2': t2['form'], 'lambda1': lambda1, 'lambda2': lambda2, 'kelly': kelly}
-    ai_text = await generate_ai_explanation(match['team1'], match['team2'], rec, confidence, stats_for_ai)
-    
-    drop_text = ""
-    if bookmaker_odds.get('is_dropping') and bookmaker_odds.get('old_odds', 0) > 0:
-        drop_text = f"\n🔥 <b>Дроп линии:</b> кэф упал с {bookmaker_odds['old_odds']} до {odds_val} (умные деньги грузят!)\n"
-    
-    # Формируем текст рынков Монте-Карло или Киберспорта
-    mc_text = ""
+    ai_text = await generate_ai_explanation(raw1, raw2, rec, confidence,
+                                            {'form1': t1['form'], 'form2': t2['form'], 'lambda1': lambda1, 'lambda2': lambda2, 'kelly': kelly})
+    drop_text = f"\n🔥 <b>Дроп линии:</b> кэф упал с {bookmaker_odds['old_odds']} до {odds_val} (умные деньги грузят!)\n" if bookmaker_odds.get('is_dropping') and bookmaker_odds.get('old_odds', 0) > 0 else ""
+
     if sport == 'esports':
-        # Расчет котировок по картам
         elo_diff = t1['elo_rating'] - t2['elo_rating']
-        p1_map_prob = 1 / (1 + 10 ** (-elo_diff / 400)) * 100
-        match_format = match.get('format', 3)
-        map_markets = EsportsMapModel.calculate_maps(p1_map_prob, match_format)
-        
+        p1_map = 1 / (1 + 10 ** (-elo_diff/400)) * 100
+        fmt = match.get('format') or 1
+        mm = EsportsMapModel.calculate_maps(p1_map, fmt)
         mc_text = "🎮 <b>Рынки по картам:</b>\n"
-        if match_format == 3:
-            mc_text += (f"• Тотал карт больше 2.5: {map_markets.get('tb_2_5', 0)}%\n"
-                        f"• Фора 1 (-1.5): {map_markets.get('f1_minus_1_5', 0)}% | Фора 2 (+1.5): {map_markets.get('f2_plus_1_5', 0)}%\n"
-                        f"• Фора 1 (+1.5): {map_markets.get('f1_plus_1_5', 0)}% | Фора 2 (-1.5): {map_markets.get('f2_minus_1_5', 0)}%\n\n")
-        elif match_format == 5:
-            mc_text += (f"• Тотал карт больше 3.5: {map_markets.get('tb_3_5', 0)}%\n"
-                        f"• Фора 1 (-1.5): {map_markets.get('f1_minus_1_5', 0)}% | Фора 2 (+1.5): {map_markets.get('f2_plus_1_5', 0)}%\n\n")
+        if fmt == 3:
+            mc_text += (f"• Тотал карт больше 2.5: {mm.get('tb_2_5',0)}%\n"
+                        f"• Фора 1 (-1.5): {mm.get('f1_minus_1_5',0)}% | Фора 2 (+1.5): {mm.get('f2_plus_1_5',0)}%\n"
+                        f"• Фора 1 (+1.5): {mm.get('f1_plus_1_5',0)}% | Фора 2 (-1.5): {mm.get('f2_minus_1_5',0)}%\n\n")
+        elif fmt == 5:
+            mc_text += (f"• Тотал карт больше 3.5: {mm.get('tb_3_5',0)}%\n"
+                        f"• Фора 1 (-1.5): {mm.get('f1_minus_1_5',0)}% | Фора 2 (+1.5): {mm.get('f2_plus_1_5',0)}%\n\n")
         else:
-            mc_text += "• Формат: Bo1 (Рынки по картам недоступны)\n\n"
+            mc_text += "• Формат: Bo1 (рынки по картам недоступны)\n\n"
     else:
-        mc = result.get('mc') or {}
-        top_score = mc.get('top_score', '1:1')
-        mc_text = (
-            f"🎲 <b>Доп. рынки (Monte Carlo):</b>\n"
-            f"• Точный счет: <b>{top_score}</b> ({mc.get('top_score_prob', 0)}%)\n"
-            f"• Обе забьют (ОЗ-Да): {mc.get('btts_prob', 0)}%\n"
-            f"• Тотал больше 2.5: {mc.get('over_2_5_prob', 0)}%\n"
-            f"• Двойной шанс (1X): {mc.get('dc_1x', 0)}% | (12): {mc.get('dc_12', 0)}%\n"
-            f"• Фора 1 (-1.5): {mc.get('ah1_-1.5', 0)}% | Фора 2 (+1): {mc.get('ah2_+1', 0)}%\n\n"
-        )
-    
-    analysis = (
-        f"🏆 <b>{match.get('tournament', '')}</b>\n"
-        f"📊 П1={result['p1']}% | X={result.get('x',0)}% | П2={result['p2']}%\n"
-        f"📈 Кэф: {odds_val} | Kelly: {kelly}%\n"
-        f"{drop_text}\n"
-        f"{mc_text}"
-        f"{ai_text}\n"
-    )
-    
-    return {'analysis': analysis, 'probabilities': {'p1': result['p1'], 'x': result.get('x', 0), 'p2': result['p2'], 'method': result['method'], 'components': result.get('components'), 'odds': odds_val, 'kelly': kelly, 'rec': rec, 'top_score': top_score if sport != 'esports' else 'N/A', 'btts': mc.get('btts_prob', 0) if sport != 'esports' else 0}, 'recommendation': rec, 'confidence': confidence, 'bet_type': 'Исход'}
+        mc_text = (f"🎲 <b>Доп. рынки (Monte Carlo):</b>\n"
+                   f"• Точный счет: <b>{top_score}</b> ({mc.get('top_score_prob',0)}%)\n"
+                   f"• Обе забьют (ОЗ-Да): {mc.get('btts_prob',0)}%\n"
+                   f"• Тотал больше 2.5: {mc.get('over_2_5_prob',0)}%\n"
+                   f"• Двойной шанс (1X): {mc.get('dc_1x',0)}% | (12): {mc.get('dc_12',0)}%\n"
+                   f"• Фора 1 (-1.5): {mc.get('ah1_-1.5',0)}% | Фора 2 (+1): {mc.get('ah2_+1',0)}%\n\n")
+
+    analysis = (f"🏆 <b>{trn}</b>\n📊 П1={result['p1']}% | X={result.get('x',0)}% | П2={result['p2']}%\n"
+                f"📈 Кэф: {odds_val} | Kelly: {kelly}%\n{drop_text}\n{mc_text}{ai_text}\n")
+    return {'analysis': analysis, 'probabilities': {'p1': result['p1'], 'x': result.get('x', 0), 'p2': result['p2'],
+            'method': result['method'], 'components': result.get('components'), 'odds': odds_val, 'kelly': kelly,
+            'rec': rec, 'rec_code': rec_code, 'top_score': top_score if sport != 'esports' else 'N/A',
+            'btts': mc.get('btts_prob', 0) if sport != 'esports' else 0},
+            'recommendation': rec, 'confidence': confidence, 'bet_type': 'Исход'}
 
 async def collect_and_analyze_job():
     db = await get_db()
-    matches = await fetch_football_matches()
+    matches = list(await fetch_football_matches())      # копия — не мутируем кэш
     matches.extend(await fetch_pandascore_matches())
     matches.extend(await fetch_hockey_matches())
+    matches.extend(await fetch_basketball_matches())    # НОВОЕ
+    matches.extend(await fetch_mma_matches())           # НОВОЕ
     for m in matches:
         try:
             pred = await analyze_match(m)
             if pred and pred['confidence'] >= MIN_CONFIDENCE:
-                await db.execute("INSERT OR REPLACE INTO matches (match_id, sport, team1, team2, match_date, tournament) VALUES (?, ?, ?, ?, ?, ?)", (m['id'], m['sport'], m['team1'], m['team2'], _normalize_date(m.get('date', '')), m.get('tournament', 'Unknown')))
-                await save_prediction(m['id'], m['sport'], m['team1'], m['team2'], m.get('tournament', 'Unknown'), pred['analysis'], pred['probabilities'], pred['recommendation'], pred['confidence'], pred['bet_type'])
+                await db.execute("INSERT OR REPLACE INTO matches (match_id, sport, team1, team2, match_date, tournament) VALUES (?, ?, ?, ?, ?, ?)",
+                                 (m['id'], m['sport'], m['team1'], m['team2'], _normalize_date(m.get('date', '')), m.get('tournament', 'Unknown')))
+                await save_prediction(m['id'], m['sport'], m['team1'], m['team2'], m.get('tournament', 'Unknown'),
+                                      pred['analysis'], pred['probabilities'], pred['recommendation'], pred['confidence'], pred['bet_type'])
         except Exception as e:
             logger.error(f"Error analyzing {m.get('team1')}: {e}")
     await db.commit()
 
-# ==================== ИНТЕРФЕЙС БОТА (ПАГИНАЦИЯ) ====================
-
+# ==================== ИНТЕРФЕЙС БОТА (5 видов спорта) ====================
 def get_main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔥 Live Матчи", callback_data="live_matches")],
@@ -894,6 +982,9 @@ def get_main_keyboard():
         [InlineKeyboardButton(text="⚽️ Футбол", callback_data="sport_football"),
          InlineKeyboardButton(text="🏒 Хоккей", callback_data="sport_hockey"),
          InlineKeyboardButton(text="🎮 Киберспорт", callback_data="sport_esports")],
+        [InlineKeyboardButton(text="🏀 Баскетбол", callback_data="sport_basketball"),
+         InlineKeyboardButton(text="🥊 Бокс/ММА", callback_data="sport_mma")],
+        [InlineKeyboardButton(text="📚 Обучение модели", callback_data="learning")],
         [InlineKeyboardButton(text="💰 Мой банк", callback_data="my_bank"),
          InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")]
     ])
@@ -904,115 +995,90 @@ def get_back_button():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await add_user(message.from_user.id, message.from_user.username or "unknown")
-    await message.answer("🤖 Я — ML-бот для спортивных прогнозов. У меня есть Виртуальный банк, Монте-Карло и ИИ-аналитик. Выбери раздел:", parse_mode="HTML", reply_markup=get_main_keyboard())
+    await message.answer("🤖 ML-бот прогнозов: футбол, хоккей, киберспорт, баскетбол, бокс/ММА. Виртуальный банк, Монте-Карло, ИИ и самообучение.", parse_mode="HTML", reply_markup=get_main_keyboard())
 
 @dp.callback_query(F.data == "back_to_start")
 async def back_to_start(callback: types.CallbackQuery):
     await callback.message.edit_text("🏠 <b>Главное меню</b>", parse_mode="HTML", reply_markup=get_main_keyboard())
     await callback.answer()
 
+@dp.callback_query(F.data == "learning")
+async def show_learning(callback: types.CallbackQuery):
+    await callback.answer("📚 Собираю статистику обучения...")
+    await callback.message.edit_text(await get_learning_dashboard(), parse_mode="HTML", reply_markup=get_back_button())
+
 @dp.callback_query(F.data == "my_bank")
 async def show_bank(callback: types.CallbackQuery):
-    db = await get_db()
-    user_id = callback.from_user.id
-    
-    # Безопасное извлечение баланса
-    async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
-        row = await cursor.fetchone()
-    
+    db = await get_db(); user_id = callback.from_user.id
+    async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as c:
+        row = await c.fetchone()
     if not row:
-        # Если пользователя нет в базе — добавляем его
-        await add_user(user_id, callback.from_user.username or "unknown")
-        balance = INITIAL_VIRTUAL_BALANCE
+        await add_user(user_id, callback.from_user.username or "unknown"); balance = INITIAL_VIRTUAL_BALANCE
     else:
         balance = row[0]
-        
-    # Безопасное извлечение статистики
-    async with db.execute("SELECT COUNT(*) as total, SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) as won FROM virtual_bets WHERE user_id = ? AND status != 0", (user_id,)) as cursor:
-        stats = await cursor.fetchone()
-        
-    if stats and stats[0] is not None:
-        total_bets = stats[0]
-        won_bets = stats[1] if stats[1] is not None else 0
-        roi = round((won_bets / total_bets * 100), 1) if total_bets > 0 else 0
-    else:
-        total_bets = 0
-        won_bets = 0
-        roi = 0
-        
-    text = (f"💰 <b>Виртуальный банк</b>\n\n"
-            f"💵 Текущий баланс: <b>{balance:.2f} у.е.</b>\n"
-            f"📊 Разыграно ставок: {total_bets}\n"
-            f"✅ Выиграно: {won_bets}\n"
-            f"📈 Точность (ROI): {roi}%\n\n"
-            f"Делайте ставки на прогнозы, чтобы протестировать бота без риска!")
-            
+    async with db.execute("""SELECT COUNT(*) AS total, SUM(CASE WHEN status=1 THEN 1 ELSE 0 END) AS won,
+            SUM(bet_amount) AS staked,
+            SUM(CASE WHEN status=1 THEN bet_amount*(odds-1) WHEN status=2 THEN -bet_amount ELSE 0 END) AS profit
+            FROM virtual_bets WHERE user_id = ? AND status != 0""", (user_id,)) as c:
+        s = await c.fetchone()
+    total = s[0] or 0; won = int(s[1] or 0); staked = s[2] or 0; profit = s[3] or 0
+    winrate = round(won/total*100, 1) if total else 0
+    roi = round(profit/staked*100, 1) if staked else 0
+    text = (f"💰 <b>Виртуальный банк</b>\n\n💵 Баланс: <b>{balance:.2f} у.е.</b>\n📊 Ставок сыграно: {total}\n✅ Выиграно: {won}\n"
+            f"🎯 Win-Rate: <b>{winrate}%</b>\n📈 ROI: <b>{roi}%</b> (прибыль {profit:+.2f} у.е.)\n\nТестируй бота без риска реальными деньгами!")
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_back_button())
     await callback.answer()
 
 @dp.callback_query(F.data == "live_matches")
 async def show_live_matches(callback: types.CallbackQuery):
     await callback.answer("🔴 Загружаю live матчи...")
-    fb_matches = await fetch_live_football_matches()
-    es_matches = await fetch_live_esports_matches()
-    if not fb_matches and not es_matches:
-        await callback.message.edit_text("😔 Сейчас нет live матчей в топ-лигах.", reply_markup=get_back_button())
-        return
+    fb = await fetch_live_football_matches(); es = await fetch_live_esports_matches()
+    if not fb and not es:
+        await callback.message.edit_text("😔 Сейчас нет live матчей в топ-лигах.", reply_markup=get_back_button()); return
     text = ""
-    if fb_matches:
+    if fb:
         text += "⚽️ <b>Футбол (Live)</b>\n\n"
-        for match in fb_matches: text += await analyze_live_football_match(match) + "\n➖➖➖➖➖➖➖➖➖\n"
-    if es_matches:
+        for m in fb: text += await analyze_live_football_match(m) + "\n➖➖➖➖➖➖➖➖➖\n"
+    if es:
         text += "\n🎮 <b>Киберспорт (Live)</b>\n\n"
-        for match in es_matches: text += await analyze_live_esports_match(match) + "\n➖➖➖➖➖➖➖➖➖\n"
+        for m in es: text += await analyze_live_esports_match(m) + "\n➖➖➖➖➖➖➖\n"
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_back_button())
 
 @dp.callback_query(F.data == "today")
 async def show_today(callback: types.CallbackQuery):
     await callback.answer("⏳ Загружаю прогнозы...")
-    predictions = await get_today_predictions()
-    if not predictions:
-        await callback.message.edit_text("😔 На сегодня пока нет прогнозов.", reply_markup=get_back_button())
-        return
-    text = f"📅 <b>Прогнозы на сегодня ({len(predictions)} шт.)</b>\n\n"
-    for i, pred in enumerate(predictions[:10], 1):
-        text += f"{i}. <b>{pred[2]} vs {pred[3]}</b>\n   💰 {pred[7]} ({pred[8]}%)\n\n"
+    preds = await get_today_predictions()
+    if not preds:
+        await callback.message.edit_text("😔 На сегодня пока нет прогнозов.", reply_markup=get_back_button()); return
+    text = f"📅 <b>Прогнозы на сегодня ({len(preds)} шт.)</b>\n\n"
+    for i, p in enumerate(preds[:10], 1):
+        text += f"{i}. <b>{_esc(p[2])} vs {_esc(p[3])}</b>\n   💰 {p[7]} ({p[8]}%)\n\n"
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_back_button())
 
-async def show_sport_page(callback: types.CallbackQuery, sport: str, page: int):
-    sport_names = {'football': '⚽️ Футбол', 'hockey': '🏒 Хоккей', 'esports': '🎮 Киберспорт'}
-    if sport == 'football': matches = await fetch_football_matches()
-    elif sport == 'hockey': matches = await fetch_hockey_matches()
-    else: matches = await fetch_pandascore_matches()
-    
+def _fetch_for_sport(sport):
+    return {'football': fetch_football_matches, 'hockey': fetch_hockey_matches, 'basketball': fetch_basketball_matches,
+            'mma': fetch_mma_matches, 'esports': fetch_pandascore_matches}.get(sport, fetch_pandascore_matches)
+
+async def show_sport_page(callback, sport, page):
+    names = {'football': '⚽️ Футбол', 'hockey': '🏒 Хоккей', 'esports': '🎮 Киберспорт',
+             'basketball': '🏀 Баскетбол', 'mma': '🥊 Бокс/ММА'}
+    matches = await _fetch_for_sport(sport)()
     if not matches:
-        await callback.message.edit_text("Матчи не найдены.", reply_markup=get_back_button())
-        return
-        
-    items_per_page = 7
-    start_idx = page * items_per_page
-    end_idx = start_idx + items_per_page
-    page_matches = matches[start_idx:end_idx]
-    
-    kb = []
-    for m in page_matches:
-        kb.append([InlineKeyboardButton(text=f"{m['team1']} vs {m['team2']}", callback_data=f"match_{m['id']}_{sport}")])
-    
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page_{sport}_{page-1}"))
-    if end_idx < len(matches):
-        nav_buttons.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"page_{sport}_{page+1}"))
-    if nav_buttons:
-        kb.append(nav_buttons)
-        
+        await callback.message.edit_text("Матчи не найдены.", reply_markup=get_back_button()); return
+    per = 7; start = page*per; end = start+per
+    kb = [[InlineKeyboardButton(text=f"{m['team1']} vs {m['team2']}", callback_data=f"match_{m['id']}_{sport}")] for m in matches[start:end]]
+    nav = []
+    if page > 0: nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page_{sport}_{page-1}"))
+    if end < len(matches): nav.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"page_{sport}_{page+1}"))
+    if nav: kb.append(nav)
     kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_start")])
-    
-    await callback.message.edit_text(f"{sport_names[sport]} - Страница {page+1} (Выбери матч):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.message.edit_text(f"{names.get(sport, sport)} — Страница {page+1} (выбери матч):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data.startswith("sport_"))
 async def show_sport(callback: types.CallbackQuery):
-    sport = callback.data.split("_")[1]
+    sport = callback.data.split("_", 1)[1]
+    if sport not in ALLOWED_SPORTS:
+        await callback.answer("Неизвестный раздел.", show_alert=True); return
     await callback.answer("🔍 Ищу матчи...")
     await show_sport_page(callback, sport, 0)
 
@@ -1024,72 +1090,64 @@ async def change_page(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("match_"))
 async def show_match_analysis(callback: types.CallbackQuery):
-    parts = callback.data.split("_", 1)[1].rsplit("_", 1)
+    parts = callback.data.split("_", 1)[1].rsplit("_", 1)   # устойчиво к подчёркиваниям в id (af_/hk_/bk_/mma_/ps_)
     match_id, sport = parts[0], parts[1]
     await callback.answer("🧮 Анализирую...")
-    
-    matches = await fetch_football_matches() if sport == 'football' else (await fetch_hockey_matches() if sport == 'hockey' else await fetch_pandascore_matches())
+    matches = await _fetch_for_sport(sport)()
     match = next((m for m in matches if m['id'] == match_id), None)
     if not match:
-        await callback.message.edit_text("Матч не найден.", reply_markup=get_back_button())
-        return
-        
+        await callback.message.edit_text("Матч не найден (возможно, кэш устарел — вернитесь в раздел).", reply_markup=get_back_button()); return
     pred = await analyze_match(match)
     if not pred:
-        await callback.message.edit_text("Не удалось рассчитать вероятности.", reply_markup=get_back_button())
-        return
-        
-    odds = pred['probabilities'].get('odds', 0)
-    text = f"🏆 <b>{match['team1']} vs {match['team2']}</b>\n\n{pred['analysis']}"
-    
+        await callback.message.edit_text("Не удалось рассчитать вероятности.", reply_markup=get_back_button()); return
+    text = f"🏆 <b>{_esc(match['team1'])} vs {_esc(match['team2'])}</b>\n\n{pred['analysis']}"
     kb = []
-    if odds > 1.0 and pred['probabilities']['p1'] > 0:
-        user_id = callback.from_user.id
-        balance = await get_balance(user_id)
+    odds = pred['probabilities'].get('odds', 0)
+    rec_code = pred['probabilities'].get('rec_code', 'P1')
+    rec_label = {'P1': 'П1', 'P2': 'П2', 'X': 'Ничья'}.get(rec_code, rec_code)
+    if odds > 1.0:
+        balance = await get_balance(callback.from_user.id)
         kelly_pct = pred['probabilities'].get('kelly', 0)
-        bet_amount = max(10.0, round(balance * (kelly_pct / 100.0), 2)) if kelly_pct > 0 else 100.0
+        bet_amount = max(10.0, round(balance * (kelly_pct/100.0), 2)) if kelly_pct > 0 else 100.0
         bet_amount = min(bet_amount, balance)
-        
-        cb_data = f"bet_{match_id}_{odds}_П1_{bet_amount}"
-        btn_text = f"Поставить {bet_amount:.2f} у.е. на П1 (Кэф {odds})"
-        if kelly_pct > 0: btn_text += f" | Value Bet {kelly_pct}%"
+        cb_data = f"bet|{match_id}|{odds}|{rec_code}|{bet_amount}"
+        btn_text = f"Поставить {bet_amount:.2f} у.е. на {rec_label} (Кэф {odds})"
+        if kelly_pct > 0: btn_text += f" | Value {kelly_pct}%"
         kb.append([InlineKeyboardButton(text=btn_text, callback_data=cb_data)])
-        
     kb.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_start")])
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@dp.callback_query(F.data.startswith("bet_"))
+@dp.callback_query(F.data.startswith("bet|"))
 async def process_virtual_bet(callback: types.CallbackQuery):
     try:
-        parts = callback.data.split("_", 1)[1].rsplit("_", 3)
-        match_id, odds_str, rec, amount_str = parts[0], parts[1], parts[2], parts[3]
-        odds = float(odds_str)
-        amount = float(amount_str)
+        _, match_id, odds_str, rec_code, amount_str = callback.data.split("|")
+        odds, amount = float(odds_str), float(amount_str)
     except Exception:
-        await callback.answer("Ошибка обработки ставки.", show_alert=True)
-        return
-    
-    user_id = callback.from_user.id
-    balance = await get_balance(user_id)
-    if balance < amount:
-        await callback.answer("Недостаточно средств на балансе!", show_alert=True)
-        return
-        
-    await place_virtual_bet(user_id, match_id, amount, odds, f"{rec} {match_id}")
-    await callback.answer(f"Ставка {amount:.2f} у.е. на {rec} принята!", show_alert=True)
-    new_balance = await get_balance(user_id)
-    await callback.message.edit_text(f"✅ Ставка принята!\nВаш баланс: {new_balance:.2f} у.е.", reply_markup=get_back_button())
+        await callback.answer("Ошибка обработки ставки.", show_alert=True); return
+    rec_label = {'P1': 'П1', 'P2': 'П2', 'X': 'Ничья'}.get(rec_code, rec_code)
+    ok = await place_virtual_bet(callback.from_user.id, match_id, amount, odds, f"{rec_label} ({match_id})")
+    if not ok:
+        await callback.answer("Недостаточно средств на балансе!", show_alert=True); return
+    await callback.answer(f"Ставка {amount:.2f} у.е. на {rec_label} принята!", show_alert=True)
+    nb = await get_balance(callback.from_user.id)
+    await callback.message.edit_text(f"✅ Ставка принята!\nВаш баланс: {nb:.2f} у.е.", reply_markup=get_back_button())
 
 @dp.callback_query(F.data == "settings")
 async def show_settings(callback: types.CallbackQuery):
     db = await get_db()
-    async with db.execute("SELECT football, hockey, esports FROM user_settings WHERE user_id = ?", (callback.from_user.id,)) as cursor:
-        settings = await cursor.fetchone()
-    if not settings: return
+    async with db.execute("SELECT football, hockey, esports, basketball, mma FROM user_settings WHERE user_id = ?", (callback.from_user.id,)) as c:
+        s = await c.fetchone()
+    if not s:
+        await add_user(callback.from_user.id, callback.from_user.username or "unknown")
+        async with db.execute("SELECT football, hockey, esports, basketball, mma FROM user_settings WHERE user_id = ?", (callback.from_user.id,)) as c:
+            s = await c.fetchone()
+    if not s: s = (1, 1, 1, 1, 1)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"⚽️ Футбол [{'✅' if settings[0] else '❌'}]", callback_data=f"set_football_{settings[0]}"),
-         InlineKeyboardButton(text=f"🏒 Хоккей [{'✅' if settings[1] else '❌'}]", callback_data=f"set_hockey_{settings[1]}"),
-         InlineKeyboardButton(text=f"🎮 Киберспорт [{'✅' if settings[2] else '❌'}]", callback_data=f"set_esports_{settings[2]}")],
+        [InlineKeyboardButton(text=f"⚽️ Футбол [{'✅' if s[0] else '❌'}]", callback_data=f"set_football_{s[0]}"),
+         InlineKeyboardButton(text=f"🏒 Хоккей [{'✅' if s[1] else '❌'}]", callback_data=f"set_hockey_{s[1]}")],
+        [InlineKeyboardButton(text=f"🎮 Киберспорт [{'✅' if s[2] else '❌'}]", callback_data=f"set_esports_{s[2]}"),
+         InlineKeyboardButton(text=f"🏀 Баскетбол [{'✅' if s[3] else '❌'}]", callback_data=f"set_basketball_{s[3]}")],
+        [InlineKeyboardButton(text=f"🥊 Бокс/ММА [{'✅' if s[4] else '❌'}]", callback_data=f"set_mma_{s[4]}")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_start")]
     ])
     await callback.message.edit_text("⚙️ <b>Настройки рассылки</b>", parse_mode="HTML", reply_markup=kb)
@@ -1097,52 +1155,60 @@ async def show_settings(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("set_"))
 async def toggle_setting(callback: types.CallbackQuery):
     _, sport, val = callback.data.split("_")
-    new_val = 0 if int(val) == 1 else 1
+    if sport not in ALLOWED_SPORTS:
+        await callback.answer("Неизвестный спорт.", show_alert=True); return
     db = await get_db()
-    await db.execute(f"UPDATE user_settings SET {sport} = ? WHERE user_id = ?", (new_val, callback.from_user.id))
+    await db.execute(f"UPDATE user_settings SET {sport} = ? WHERE user_id = ?", (0 if int(val) == 1 else 1, callback.from_user.id))
     await db.commit()
     await show_settings(callback)
 
-# ==================== ПЛАНИРОВЩИК И ЗАПУСК (БЕЗОПАСНАЯ РАССЫЛКА И BACKFILL В ФОНЕ) ====================
-
+# ==================== ПЛАНИРОВЩИК И ЗАПУСК ====================
 async def send_predictions_job():
-    predictions = await get_unsent_predictions(limit=PREDICTIONS_PER_HOUR)
-    if not predictions: return
-    for pred in predictions:
-        match_id, sport, team1, team2, tournament, analysis, probs_json, rec, conf, bet_type = pred
+    preds = await get_unsent_predictions(limit=PREDICTIONS_PER_HOUR)
+    if not preds: return
+    for p in preds:
+        match_id, sport, _t1, _t2, _tr, analysis, _pj, rec, conf, _bt = p
         text = f"💰 <b>Прогноз:</b> {rec} ({conf}%)\n{analysis}"
-        users = await get_users_for_sport(sport)
-        for user_id in users:
+        for uid in await get_users_for_sport(sport):
             try:
-                await bot.send_message(user_id, text, parse_mode="HTML")
+                # ЗАДАЧА №1: кнопка «Главное меню» под каждым прогнозом в рассылке
+                await bot.send_message(uid, text, parse_mode="HTML", reply_markup=get_back_button())
                 await asyncio.sleep(0.05)
             except TelegramRetryAfter as e:
-                logger.warning(f"Flood control. Ожидаю {e.retry_after} сек.")
-                await asyncio.sleep(e.retry_after)
+                logger.warning(f"Flood control. Жду {e.retry_after} сек."); await asyncio.sleep(e.retry_after)
             except (TelegramForbiddenError, TelegramBadRequest) as e:
-                logger.error(f"Не могу отправить сообщение {user_id} (заблокировал бота?): {e}")
+                logger.error(f"Не отправить {uid} (заблокировал бота?): {e}")
             except Exception as e:
-                logger.error(f"Неизвестная ошибка отправки {user_id}: {e}")
+                logger.error(f"Ошибка отправки {uid}: {e}")
         await mark_prediction_sent(match_id, SYSTEM_USER_ID)
 
 async def check_results_job():
     try: await check_and_update_finished_matches()
-    except Exception as e: logger.error(f"Ошибка check_results_job: {e}")
+    except Exception as e: logger.error(f"check_results_job: {e}")
 
 async def recompute_weights_job():
     try: await compute_adaptive_weights()
-    except Exception as e: logger.error(f"Ошибка recompute_weights_job: {e}")
+    except Exception as e: logger.error(f"recompute_weights_job: {e}")
+
+async def _safe_backfill():
+    try:
+        n = await backfill_football_history(); logger.info(f"Backfill завершён: обработано {n} матчей.")
+    except Exception as e:
+        logger.error(f"Backfill failed: {e}")
 
 async def main():
     global bot
-    if not TELEGRAM_TOKEN: raise RuntimeError("TELEGRAM_TOKEN не задан")
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN не задан.")
+    for name, val in [("OPENAI_API_KEY", OPENAI_API_KEY), ("FOOTBALL_API_KEY", FOOTBALL_API_KEY),
+                      ("FOOTBALLDATA_KEY", FOOTBALLDATA_KEY), ("PANDASCORE_API_KEY", PANDASCORE_API_KEY),
+                      ("THE_ODDS_API_KEY", THE_ODDS_API_KEY), ("HOCKEY_API_SPORTS", HOCKEY_API_SPORTS),
+                      ("BASKETBALL_API_KEY", BASKETBALL_API_KEY), ("MMA_API_KEY", MMA_API_KEY)]:
+        if not val: logger.warning(f"{name} не задан — раздел будет на мок-данных/пустым.")
     bot = Bot(token=TELEGRAM_TOKEN)
     await init_db()
-    
-    # Backfill запускается в фоне, чтобы не блокировать Polling
     logger.info("📚 Запускаю подгрузку истории матчей в фоне...")
-    asyncio.create_task(backfill_football_history())
-    
+    asyncio.create_task(_safe_backfill())
     scheduler = AsyncIOScheduler()
     scheduler.add_job(collect_and_analyze_job, IntervalTrigger(hours=1), next_run_time=datetime.now() + timedelta(minutes=1))
     scheduler.add_job(check_results_job, IntervalTrigger(hours=2), next_run_time=datetime.now() + timedelta(minutes=5))
@@ -1150,13 +1216,15 @@ async def main():
     scheduler.add_job(recompute_weights_job, IntervalTrigger(hours=24), next_run_time=datetime.now() + timedelta(minutes=15))
     scheduler.add_job(garbage_collector_job, IntervalTrigger(days=7))
     scheduler.start()
-    
-    logger.info("✅ Бот готов к работе!")
-    try: await dp.start_polling(bot)
+    logger.info("✅ Бот готов к работе (5 видов спорта)!")
+    try:
+        await dp.start_polling(bot)
     finally:
         if _db_conn: await _db_conn.close()
         if _http_session and not _http_session.closed: await _http_session.close()
 
 if __name__ == "__main__":
-    try: asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit): logger.info("🛑 Бот остановлен")
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("🛑 Бот остановлен")
