@@ -552,7 +552,7 @@ async def fetch_footballdata_matches():
                 out.append({"id": f"fd_{m['id']}", "team1": t1, "team2": t2, "date": m.get('utcDate',''), "sport": "football", "tournament": m.get('competition',{}).get('name','Football')})
             except Exception: continue
     return out
-  async def fetch_highlightly_hockey_matches():
+async def fetch_highlightly_hockey_matches():
     """Основной источник хоккея — Highlightly."""
     if not HIGHLIGHTLY_API_KEY: return []
     headers = {"x-rapidapi-key": HIGHLIGHTLY_API_KEY, "Accept": "application/json"}
