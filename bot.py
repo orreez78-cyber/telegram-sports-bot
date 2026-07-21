@@ -621,12 +621,15 @@ async def fetch_api_sport_hockey_matches():
 async def fetch_hockey_matches():
     c = _matches_cache.get("matches_hockey")
     if c: return c
-    real = await fetch_highlightly_hockey_matches()              # основной — Highlightly
-    if not real: real = await fetch_api_sport_hockey_matches()   # запасной — api-sports
+    real = await fetch_highlightly_hockey_matches()
+    logger.info(f"🏒 Highlightly хоккей: получено {len(real)} матчей")
+    if not real:
+        real = await fetch_api_sport_hockey_matches()
+        logger.info(f"🏒 api-sports хоккей (fallback): получено {len(real)} матчей")
     if real:
         _matches_cache.set("matches_hockey", real); return real
     return [{"id": "hk_301", "team1": "ЦСКА", "team2": "СКА", "date": datetime.now().strftime("%Y-%m-%d"), "sport": "hockey", "tournament": "КХЛ", "is_mock_source": True}]
-
+  
 async def fetch_basketball_matches():
     if not BASKETBALL_API_KEY: return []
     c = _matches_cache.get("matches_basketball")
