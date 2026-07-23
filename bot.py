@@ -3,7 +3,7 @@ import json
 import logging
 import math
 import os
-import random
+import randomа
 import time
 from datetime import datetime, timedelta
 
@@ -1287,6 +1287,7 @@ async def main():
                       ("BASKETBALL_API_KEY", BASKETBALL_API_KEY), ("MMA_API_KEY", MMA_API_KEY)]:
         if not val: logger.warning(f"{name} не задан — раздел будет на мок-данных/пустым.")
     bot = Bot(token=TELEGRAM_TOKEN)
+    await bot.delete_webhook(drop_pending_updates=True)   # <-- ДОБАВИТЬ: снимаем webhook перед polling
     await init_db()
     logger.info("📚 Запускаю подгрузку истории матчей в фоне...")
     asyncio.create_task(_safe_backfill())
